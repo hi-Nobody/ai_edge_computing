@@ -1,21 +1,35 @@
 # FinFlow HTTPS 反向代理設定 —— Caddy
 #
-# 更新說明：/telegram/*、/line/* 原本指向的 127.0.0.1:8001 沒有任何服務在監聽，
-# 現在已補上 bot-gateway/bot_gateway.py（見 bot-gateway/ 目錄），這兩條路由
-# 可以正常使用了。若尚未部署 bot-gateway，這兩段會回 502，屬預期行為。
+# 更新說明：/telegram/*、/line/*、/discord/* 原本指向的 127.0.0.1:8001 沒有
+# 任何服務在監聽（或未實作），現在已補上 bot-gateway/bot_gateway.py（見
+# bot-gateway/ 目錄），這三條路由可以正常使用了。若尚未部署 bot-gateway，
+# 這幾段會回 502，屬預期行為。
+#
+# 注意：Discord 的 Interactions Endpoint 驗證只接受受信任 CA 簽發的憑證，
+# 方案 A（下方的 tls internal 自簽憑證）無法通過 Discord 的端點驗證，
+# 要用 Discord 必須改用方案 B 或方案 C（詳見 DEPLOY.md「建立 Discord Bot」小節）。
+
+# 全域選項：caddy 服務帳號不在 sudoers 裡，無法把自簽 CA 安裝進系統信任庫，
+# 這裡明確跳過該步驟（本來就用 curl -k / verify=False，不需要系統信任這張憑證）
+{
+	skip_install_trust
+}
 
 # ============================================================
 # 方案 A（零成本，預設）：自簽憑證，綁定 Oracle 公開 IP
 # 適合：不想花錢買網域、可接受邊緣節點端用 verify=False 連線
 # ============================================================
 
-:443 {
+127.0.0.1, 10.0.0.152, 158.101.16.137 {
 	tls internal
 
 	handle /telegram/* {
 		reverse_proxy 127.0.0.1:8001
 	}
 	handle /line/* {
+		reverse_proxy 127.0.0.1:8001
+	}
+	handle /discord/* {
 		reverse_proxy 127.0.0.1:8001
 	}
 	handle {

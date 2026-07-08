@@ -12,6 +12,7 @@ Environment=TELEGRAM_BOT_TOKEN=
 Environment=TELEGRAM_WEBHOOK_SECRET=
 Environment=LINE_CHANNEL_SECRET=
 Environment=LINE_CHANNEL_ACCESS_TOKEN=
+Environment=DISCORD_PUBLIC_KEY=
 Environment=GATEWAY_DB_PATH=/home/opc/bot-gateway/bot_gateway.db
 Environment=JOB_WAIT_TIMEOUT_SEC=900
 Environment=HISTORY_MAX_MESSAGES=20

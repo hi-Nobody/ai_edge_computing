@@ -1,7 +1,23 @@
-# FinFlow 分散式邊緣運算系統部署指南（v4，合併 Gemini 修改版後）
+# FinFlow 分散式邊緣運算系統部署指南（v5，補上 Discord 支援後）
 
 > 本文件取代前一版 DEPLOY.md。主要差異：改用 venv 部署（迴避 Ubuntu 新版 pip 限制）、
-> 檔名由 main.py 改為 server.py、**不需要額外設定 cron**（維護邏輯已改回自動背景執行緒）。
+> 檔名由 main.py 改為 server.py、**不需要額外設定 cron**（維護邏輯已改回自動背景執行緒）、
+> **新增 Discord Slash Command 支援**（`bot_gateway.py` 補上 `/discord/interactions`
+> 端點，可與 Telegram/LINE 並存或互相切換）。
+>
+> 另外根據實際部署經驗補充：本文件範例路徑用 `/home/ubuntu`，但如果你是在
+> **Oracle Linux**（OCI 的 `opc` 使用者常見於此）上部署，實測會遇到 **SELinux**
+> 擋下 `EnvironmentFile=` 指向 `/home/opc/...` 底下檔案的狀況（`systemd` 的
+> `init_t` domain 預設不能讀取一般家目錄的 `user_home_t` 檔案），導致
+> `systemctl restart` 出現「Job ... failed because of unavailable resources or
+> another system error」。修法是幫該檔案加上正確的 SELinux context，**不要**
+> 直接關掉 SELinux：
+> ```bash
+> sudo semanage fcontext -a -t systemd_unit_file_t "/home/opc/finflow-queue/finflow-queue.env"
+> sudo restorecon -v /home/opc/finflow-queue/finflow-queue.env
+> ```
+> （若 `bot-gateway.service` 之後也改用 `EnvironmentFile=` 而非目前的 inline
+> `Environment=`，記得對那個檔案也做一次同樣的處理。）
 
 ---
 
@@ -80,9 +96,11 @@ sudo ./setup-https.sh
 ```bash
 mkdir -p /home/opc/bot-gateway && cd /home/opc/bot-gateway
 # 將 bot_gateway.py、requirements.txt 上傳至此資料夾
+# 若要用 Discord，也把 register_discord_commands.py 一併上傳（僅註冊指令時
+# 一次性執行，不屬於常駐服務的一部分，放同資料夾方便管理即可）
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt   # 已含 pynacl，Discord 簽章驗證需要
 ```
 
 ### 建立 Telegram Bot（若要用 Telegram）
@@ -100,6 +118,36 @@ pip install -r requirements.txt
    若用方案 A 的自簽憑證，Telegram 官方 API 不接受自簽憑證的 webhook URL——這是
    **方案 A 的已知限制**，Telegram webhook 要嘛用方案 B（正式網域 + Let's Encrypt），
    要嘛用方案 C（Cloudflare Tunnel，Cloudflare 邊緣本身就有正式憑證）。LINE 則沒有這個限制。
+
+### 建立 Discord Bot（若要用 Discord）
+
+Discord 跟 Telegram/LINE 的架構不一樣：Discord 沒有「使用者傳訊息就觸發 webhook」
+這種機制（那是 Gateway WebSocket 常駐連線的範疇），本專案改用 Discord 的
+**Slash Command + Interactions Endpoint**（使用者輸入 `/ask prompt:<內容>`
+觸發，HTTP 一次性請求，跟 Telegram/LINE 一樣是無狀態服務就能處理）。
+
+1. 到 [Discord Developer Portal](https://discord.com/developers/applications)
+   建立一個 New Application，記下：
+   - **Application ID**（General Information 頁籤）→ 給 `DISCORD_APPLICATION_ID`
+     （只有註冊指令的腳本需要，服務本身不需要）
+   - **Public Key**（同一頁）→ 給 `DISCORD_PUBLIC_KEY`（服務驗證簽章要用）
+   - 到 Bot 頁籤按 Reset Token 拿到 **Bot Token** → 給 `DISCORD_BOT_TOKEN`
+     （同樣只有註冊指令的腳本需要）
+2. 註冊 Slash Command（一次性動作，之後改指令內容才需要重跑）：
+   ```bash
+   export DISCORD_BOT_TOKEN="<Bot Token>"
+   export DISCORD_APPLICATION_ID="<Application ID>"
+   # 若想先在自己的測試伺服器立即生效，設定這個（否則 Global Command 最多要等 1 小時）：
+   # export DISCORD_GUILD_ID="<你的測試伺服器 ID>"
+   python3 register_discord_commands.py
+   ```
+3. 到 General Information 頁籤，把 **Interactions Endpoint URL** 填成
+   `https://<你的網域>/discord/interactions`，儲存時 Discord 會立刻打一次
+   PING 過去驗證簽章與連線是否正常（`bot_gateway.py` 要先跑起來才能通過這一步）。
+   **這一步只接受受信任 CA 簽發的 TLS 憑證，方案 A 的自簽憑證會驗證失敗**，
+   請改用方案 B（正式網域 + Let's Encrypt）或方案 C（Cloudflare Tunnel）。
+4. 到 OAuth2 → URL Generator，勾選 `applications.commands`（如果要在伺服器
+   中使用還要勾 `bot` 並給基本權限），產生邀請連結，把 Bot 加進你的伺服器。
 
 ### 建立 LINE Bot（若要用 LINE）
 
@@ -129,6 +177,7 @@ Environment=TELEGRAM_BOT_TOKEN=<你的 Telegram Bot Token>
 Environment=TELEGRAM_WEBHOOK_SECRET=<你自訂的 webhook secret>
 Environment=LINE_CHANNEL_SECRET=<你的 LINE Channel Secret>
 Environment=LINE_CHANNEL_ACCESS_TOKEN=<你的 LINE Channel Access Token>
+Environment=DISCORD_PUBLIC_KEY=<你的 Discord Public Key>
 Environment=GATEWAY_DB_PATH=/home/opc/bot-gateway/bot_gateway.db
 Environment=JOB_WAIT_TIMEOUT_SEC=900
 Environment=HISTORY_MAX_MESSAGES=20
@@ -155,9 +204,14 @@ curl http://127.0.0.1:8001/healthz
 
 # 經過 Caddy 的路徑（若用方案 A 自簽憑證，記得加 -k）
 curl -k https://<Oracle公開IP>/telegram/webhook   # 預期 401（沒帶正確 secret token，屬正常）
+curl https://<你的網域>/discord/interactions       # 預期 401（沒帶正確 Ed25519 簽章標頭，屬正常；
+                                                    # 這裡故意不加 -k，因為方案 A 自簽憑證對
+                                                    # Discord 本來就不適用，見上方 Discord 小節說明）
 ```
-接著直接傳訊息給你的 Telegram Bot 或 LINE 官方帳號，應該會在 `journalctl -u bot-gateway -f`
-看到處理紀錄，並收到回覆。
+接著直接傳訊息給你的 Telegram Bot、LINE 官方帳號，或在已加入 Bot 的 Discord 伺服器輸入
+`/ask prompt:你好`，應該會在 `journalctl -u bot-gateway -f` 看到處理紀錄，並收到回覆。
+Discord 的部分，先看到訊息顯示「思考中…」（deferred 回應），幾秒到幾分鐘後
+（視邊緣節點忙碌程度）會被編輯成真正的答案。
 
 ### 架構取捨說明（避免你日後誤以為是遺漏）
 
@@ -169,6 +223,11 @@ curl -k https://<Oracle公開IP>/telegram/webhook   # 預期 401（沒帶正確 
   `bot_gateway.py` 檔頭註解的完整說明）。
 - LINE 用「replyToken 快速 ACK 一句『處理中』＋ push 送真正答案」的兩段式設計，
   避免 replyToken 過期；Telegram 沒有這個限制，直接等結果送出即可。
+- Discord 用「deferred 回應（顯示『思考中…』）＋ interaction token followup 編輯」
+  的兩段式設計，概念上跟 LINE 類似，但技術機制不同：Discord 的 3 秒回應
+  時限比 LINE replyToken 更嚴格，且 followup 編輯有效期是 15 分鐘（對應
+  `JOB_WAIT_TIMEOUT_SEC` 預設值），逾時後即使任務算完成也無法再編輯那則訊息，
+  只能算逾時失敗。
 
 ---
 
@@ -197,20 +256,34 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 
 ---
 
-## 本次（v4）變更紀錄摘要
+## 變更紀錄摘要
+
+### v5（本次）
 
 | 檔案 | 變更 |
 |------|------|
-| `server.py` | 修正：能力比對死碼、DAG 依賴 vacuous-truth 漏洞、依賴失敗無串聯機制、`/system/cron` 未授權、缺少自動背景巡檢。補回：`/jobs/aggregate`、`POST /jobs`+`GET /jobs/{id}`、Session 自動壓縮。保留：優先權、DLQ、中斷偵測、扁平化 nodes schema |
+| `bot_gateway.py` | 新增 Discord 支援：`POST /discord/interactions` 端點，Ed25519 簽章驗證（`DISCORD_PUBLIC_KEY`）、Slash Command `/ask` 的 deferred 回應 + 背景任務 + interaction token followup 編輯訊息 |
+| `register_discord_commands.py`（新增） | 一次性腳本，呼叫 Discord API 註冊 `/ask` 這個 Slash Command（Global 或指定 Guild） |
+| `requirements.txt` | 新增 `pynacl`（Discord Ed25519 簽章驗證需要） |
+| `bot-gateway.service` | 新增 `DISCORD_PUBLIC_KEY` 環境變數 |
+| `Caddyfile` | 註解更新：`/discord/*` 路由現在有實際服務接手；補充 Discord Interactions Endpoint 不接受自簽憑證（方案 A）的限制 |
+| `DEPLOY.md`（本檔） | 新增「建立 Discord Bot」小節；補充 Oracle Linux 上 `EnvironmentFile=` 搭配 SELinux 的已知問題與修法（實際部署時遇到並排除） |
+
+### v4
+
+| 檔案 | 變更 |
+|------|------|
+| `server.py` | 修正：能力比對死碼、DAG 依賴 vacuous-truth 漏洞、依賴失敗無串聯機制、`/system/cron` 未授權、缺少自動背景巡檢。補回：`/jobs/aggregate`、`POST /jobs`+`GET /jobs/{id}`、Session 自動壓縮。保留：優先權、DLQ、中斷偵測、扁平化 nodes schema。新增：`GET /healthz`（無需驗證，供 Caddy / 監控腳本探活用；先前 DEPLOY.md 引用此端點但實際不存在） |
 | `bootstrap.py` | 修正：VRAM 偵測失敗回傳值（0.0→None）、Ollama 啟動等待方式（固定 sleep→主動健康檢查）、Kaggle/Colab 日誌持久化路徑 |
 | `DEPLOY.md`（本檔） | 採用 venv 部署、移除 cron 設定步驟（已不需要） |
 | `Caddyfile` | 補上：`/telegram/*`、`/line/*` 原本指向不存在的 8001 服務（會 502），現在該服務已建立，路由恢復正常 |
 | `setup-https.sh` | 未變更 |
-| `server.py` | 新增：`GET /healthz`（無需驗證，供 Caddy / 監控腳本探活用；先前 DEPLOY.md 引用此端點但實際不存在） |
 | `bot-gateway/bot_gateway.py`（新增） | Telegram / LINE webhook middleware，監聽 8001，驗證簽章後轉發進佇列、非阻塞輪詢、推播回覆 |
 
 ## 已知仍刻意保留的限制（非遺漏，是現階段判斷不值得處理）
 
 - 速率限制（rate limiting）尚未實作
 - 跨節點模型輸出品質自動評分尚未實作
+- Discord 只做了單一 Slash Command（`/ask`），沒有多指令（如 `/status` 查詢
+  節點狀態、`/cancel` 取消任務）；也沒有處理按鈕、Modal 等其他 interaction 類型
 - `requested_model`／`type` 欄位目前主要供稽核記錄使用，實際派工仍以 `required_capability` 為準，兩者語意上有重疊但刻意不合併，避免一次改動過多既有欄位語意
