@@ -1,0 +1,19 @@
+[Unit]
+Description=FinFlow Edge Queue Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/finflow-queue
+Environment=CLIENT_API_KEY=change-me-to-your-own-client-secret
+Environment=NODE_API_KEYS_JSON={"kaggle-1":"change-me-A","lightning-1":"change-me-B","colab-1":"change-me-C"}
+Environment=QUEUE_DB_PATH=/home/ubuntu/finflow-queue/queue.db
+Environment=TELEGRAM_BOT_TOKEN=
+Environment=TELEGRAM_CHAT_ID=
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target
