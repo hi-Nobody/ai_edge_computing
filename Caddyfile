@@ -1,16 +1,26 @@
 # FinFlow HTTPS 反向代理設定 —— Caddy
+#
+# 更新說明：/telegram/*、/line/* 原本指向的 127.0.0.1:8001 沒有任何服務在監聽，
+# 現在已補上 bot-gateway/bot_gateway.py（見 bot-gateway/ 目錄），這兩條路由
+# 可以正常使用了。若尚未部署 bot-gateway，這兩段會回 502，屬預期行為。
 
 # ============================================================
 # 方案 A（零成本，預設）：自簽憑證，綁定 Oracle 公開 IP
 # 適合：不想花錢買網域、可接受邊緣節點端用 verify=False 連線
-# 注意：DuckDNS 等免費動態 DNS 服務已停止營運（2025年），
-#       本方案完全不依賴任何動態 DNS，直接綁定 IP，無此問題
 # ============================================================
 
 :443 {
 	tls internal
 
-	reverse_proxy 127.0.0.1:8000
+	handle /telegram/* {
+		reverse_proxy 127.0.0.1:8001
+	}
+	handle /line/* {
+		reverse_proxy 127.0.0.1:8001
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8000
+	}
 }
 
 # ============================================================
@@ -22,7 +32,15 @@
 # ============================================================
 
 # your-domain.example.com {
-# 	reverse_proxy 127.0.0.1:8000
+# 	handle /telegram/* {
+# 		reverse_proxy 127.0.0.1:8001
+# 	}
+# 	handle /line/* {
+# 		reverse_proxy 127.0.0.1:8001
+# 	}
+# 	handle {
+# 		reverse_proxy 127.0.0.1:8000
+# 	}
 # }
 
 # ============================================================
@@ -34,6 +52,6 @@
 # 缺點：仍需要一個掛在 Cloudflare 上的網域（網域本身不是免費的，
 #       但 Cloudflare 的 Tunnel 服務本身免費）。
 # 設定步驟請見 DEPLOY.md 的「方案 C」章節，這裡的 Caddyfile 不適用，
-# 因為流量入口換成 cloudflared，Caddy 只需處理 :8000 -> 127.0.0.1:8000
-# 的簡單轉發，或甚至可以省略 Caddy，讓 cloudflared 直接指向 main.py。
+# 因為流量入口換成 cloudflared，可以省略 Caddy，讓 cloudflared 直接
+# 指向 8000（主要 API）與 8001（bot-gateway）。
 # ============================================================

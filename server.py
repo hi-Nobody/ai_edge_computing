@@ -49,6 +49,13 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 app = FastAPI(title="FinFlow Edge Queue (v4)")
 
 
+@app.get("/healthz")
+def healthz():
+    # 刻意不驗證 API Key：這是給 Caddy / OCI Health Check / 監控腳本用的存活探針，
+    # 只回報「行程還活著」，不洩漏任何任務內容或節點細節。
+    return {"status": "ok", "ts": time.time()}
+
+
 # ---------- 1. 資料庫初始化 ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)

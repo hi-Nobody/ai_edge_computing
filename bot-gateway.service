@@ -1,0 +1,24 @@
+[Unit]
+Description=FinFlow Bot Gateway (Telegram/LINE webhook middleware)
+After=network.target finflow-queue.service
+Requires=finflow-queue.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/opc/bot-gateway
+Environment=ORACLE_INTERNAL_URL=http://127.0.0.1:8000
+Environment=CLIENT_API_KEY=c6b17d1af7b812d5badf313319724aa3
+Environment=TELEGRAM_BOT_TOKEN=
+Environment=TELEGRAM_WEBHOOK_SECRET=
+Environment=LINE_CHANNEL_SECRET=
+Environment=LINE_CHANNEL_ACCESS_TOKEN=
+Environment=GATEWAY_DB_PATH=/home/opc/bot-gateway/bot_gateway.db
+Environment=JOB_WAIT_TIMEOUT_SEC=900
+Environment=HISTORY_MAX_MESSAGES=20
+ExecStart=/home/opc/bot-gateway/venv/bin/uvicorn bot_gateway:app --host 127.0.0.1 --port 8001
+Restart=always
+RestartSec=5
+User=opc
+
+[Install]
+WantedBy=multi-user.target
