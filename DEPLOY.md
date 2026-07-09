@@ -1,12 +1,16 @@
-# FinFlow 分散式邊緣運算系統部署指南（v5，補上 Discord 支援後）
+# FinFlow 分散式邊緣運算系統部署指南（v8，公開 IP 改由 finflow-queue.env 集中管理後）
 
 > 本文件取代前一版 DEPLOY.md。主要差異：改用 venv 部署（迴避 Ubuntu 新版 pip 限制）、
 > 檔名由 main.py 改為 server.py、**不需要額外設定 cron**（維護邏輯已改回自動背景執行緒）、
 > **新增 Discord Slash Command 支援**（`bot_gateway.py` 補上 `/discord/interactions`
-> 端點，可與 Telegram/LINE 並存或互相切換）。
+> 端點，可與 Telegram/LINE 並存或互相切換）、**`bootstrap.py` 改用 `edge.conf` 集中管理設定**
+> （支援 CLI 參數臨時覆蓋，見「Step 5」）、**新增 `g4f_worker.py` 虛擬節點**（不需要 GPU，
+> 用 g4f 逆向 API 當作額外一個運算節點，見「Step 5.5」）、**`Caddyfile`／`setup-https.sh`
+> 的 Oracle 公開 IP 改從 `finflow-queue.env` 的 `ORACLE_PUBLIC_IP` 讀取**，不再寫死在會被
+> commit 的檔案裡（見「Step 4」）。
 >
-> 另外根據實際部署經驗補充：本文件範例路徑用 `/home/ubuntu`，但如果你是在
-> **Oracle Linux**（OCI 的 `opc` 使用者常見於此）上部署，實測會遇到 **SELinux**
+> 另外根據實際部署經驗補充：本文件範例路徑統一使用 `/home/opc`（OCI 預設使用者）。
+> 若你在 **Oracle Linux** 上部署，實測會遇到 **SELinux**
 > 擋下 `EnvironmentFile=` 指向 `/home/opc/...` 底下檔案的狀況（`systemd` 的
 > `init_t` domain 預設不能讀取一般家目錄的 `user_home_t` 檔案），導致
 > `systemctl restart` 出現「Job ... failed because of unavailable resources or
@@ -16,19 +20,19 @@
 > sudo semanage fcontext -a -t systemd_unit_file_t "/home/opc/finflow-queue/finflow-queue.env"
 > sudo restorecon -v /home/opc/finflow-queue/finflow-queue.env
 > ```
-> （若 `bot-gateway.service` 之後也改用 `EnvironmentFile=` 而非目前的 inline
-> `Environment=`，記得對那個檔案也做一次同樣的處理。）
+> （`bot-gateway.service` 目前仍用 inline `Environment=`；若之後也改用
+> `EnvironmentFile=`，記得對那個檔案也做一次同樣的處理。）
 
 ---
 
 ## Step 1：Oracle 核心端安裝
 
-由於 Ubuntu 較新版本對系統層級 `pip install` 有限制（PEP 668），請使用虛擬環境：
+本文件範例路徑統一使用 `/home/opc`（Oracle Linux 上 OCI 預設的使用者），並用虛擬環境安裝
+（不論是 Ubuntu 新版 pip 的 PEP 668 限制，或是 Oracle Linux，用 venv 都是最省事的做法）：
 
 ```bash
-mkdir -p /home/ubuntu/finflow-queue && cd /home/ubuntu/finflow-queue
+mkdir -p /home/opc/finflow-queue && cd /home/opc/finflow-queue
 # 將 server.py 上傳至此資料夾
-sudo apt update && sudo apt install -y python3-venv
 python3 -m venv venv
 source venv/bin/activate
 pip install fastapi uvicorn pydantic requests
@@ -42,48 +46,80 @@ python3 -c "import secrets; print(secrets.token_hex(16))"   # 重複執行產生
 
 決定好 `CLIENT_API_KEY`（給你自己的開發工具用）與每個邊緣節點各自的金鑰後，**先把它們登記起來**，這是 Per-node 金鑰設計換來「能單獨撤掉某個節點」的代價（見前述對話的詳細說明）。
 
-## Step 3：設定為常駐服務
+把這些金鑰填進 `/home/opc/finflow-queue/finflow-queue.env`（**這個檔案不要 commit 進版本控制**，
+repo 裡的 `finflow-queue.env` 只是空值佔位的範本，實機上請填入真實值）：
 
 ```bash
-sudo tee /etc/systemd/system/finflow-queue.service << 'SERVICEEOF'
-[Unit]
-Description=FinFlow Edge Queue Server
-After=network.target
+CLIENT_API_KEY=<你剛產生的金鑰>
+NODE_API_KEYS_JSON={"kaggle-1":"<金鑰A>","lightning-1":"<金鑰B>","colab-1":"<金鑰C>"}
+QUEUE_DB_PATH=/home/opc/finflow-queue/finflow_queue.db
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+ORACLE_PUBLIC_IP=<你的 Oracle 執行個體公開 IP，Step 4 的 setup-https.sh／Caddyfile 會讀這個值>
+```
 
-[Service]
-Type=simple
-WorkingDirectory=/home/ubuntu/finflow-queue
-Environment=CLIENT_API_KEY=change-me-to-your-own-client-secret
-Environment=NODE_API_KEYS_JSON={"kaggle-1":"change-me-A","lightning-1":"change-me-B","colab-1":"change-me-C"}
-Environment=QUEUE_DB_PATH=/home/ubuntu/finflow-queue/finflow_queue.db
-Environment=TELEGRAM_BOT_TOKEN=
-Environment=TELEGRAM_CHAT_ID=
-ExecStart=/home/ubuntu/finflow-queue/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
-Restart=always
-RestartSec=5
-User=ubuntu
-WorkingDirectory=/home/ubuntu/finflow-queue
+## Step 3：設定為常駐服務
 
-[Install]
-WantedBy=multi-user.target
-SERVICEEOF
+`finflow-queue.service` 用 `EnvironmentFile=` 讀取上一步的 `finflow-queue.env`，**真實金鑰不會出現在
+這份會被 commit 的 unit file 裡**（這也是為什麼上一步特別提醒 `finflow-queue.env` 不要 commit：
+兩者搭配才能讓「秘密值」跟「服務設定」分離）：
 
+```bash
+sudo cp /home/opc/finflow-queue/finflow-queue.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable finflow-queue
 sudo systemctl start finflow-queue
 sudo systemctl status finflow-queue
 ```
 
+`finflow-queue.service` 內容如下（repo 裡已經是這份，不需要再手動 `tee`）：
+
+```ini
+[Unit]
+Description=FinFlow Edge Queue Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/opc/finflow-queue
+EnvironmentFile=/home/opc/finflow-queue/finflow-queue.env
+ExecStart=/home/opc/finflow-queue/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+User=opc
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Oracle Linux 上請記得先做 SELinux 修正**（見文件最上方的說明），否則 `EnvironmentFile=` 指向
+`/home/opc` 底下的檔案會被 SELinux 擋下，出現「Job ... failed because of unavailable resources or
+another system error」：
+
+```bash
+sudo semanage fcontext -a -t systemd_unit_file_t "/home/opc/finflow-queue/finflow-queue.env"
+sudo restorecon -v /home/opc/finflow-queue/finflow-queue.env
+```
+
 **不需要額外設定 cron 排程**——容錯巡檢（逾時重排、DLQ、資源枯竭通知）已在 server.py 啟動時自動以背景執行緒每 15 秒跑一次，`/system/cron` 端點只是保留給你手動觸發測試用（已加上 `CLIENT_API_KEY` 驗證）。
 
 ## Step 4：啟用 HTTPS
 
-沿用前一版的 `Caddyfile` / `setup-https.sh`，內容未變（這部分跟本次的 server.py/bootstrap.py 修正無關）：
+`Caddyfile` 跟 `setup-https.sh` 現在都改成從 `finflow-queue.env` 讀 `ORACLE_PUBLIC_IP`，
+不再把真實公開 IP 寫死進這兩個會被 commit 的檔案（用法跟 Step 3 的金鑰分離是同一套邏輯）。
+執行前**務必先確認 Step 2 的 `finflow-queue.env` 裡 `ORACLE_PUBLIC_IP` 已經填好**，腳本會在
+一開始檢查這個值，沒填會直接報錯退出：
 
 ```bash
 chmod +x setup-https.sh
 sudo ./setup-https.sh
 ```
+
+腳本內部流程：讀取 `ORACLE_PUBLIC_IP` → 安裝 Caddy → 複製 `Caddyfile` 到
+`/etc/caddy/Caddyfile`（檔案內容是 `{$ORACLE_PUBLIC_IP}` 佔位符，不是真實 IP）→
+幫 `caddy.service` 建立一個 systemd drop-in（`EnvironmentFile=finflow-queue.env`），
+讓 Caddy 進程啟動時能讀到這個環境變數並代入 `{$ORACLE_PUBLIC_IP}` → 啟動 Caddy →
+開防火牆。
 
 別忘了到 OCI 控制台的 Security List 開放 443 port，這一步腳本做不到。
 
@@ -95,9 +131,9 @@ sudo ./setup-https.sh
 
 ```bash
 mkdir -p /home/opc/bot-gateway && cd /home/opc/bot-gateway
-# 將 bot_gateway.py、requirements.txt 上傳至此資料夾
-# 若要用 Discord，也把 register_discord_commands.py 一併上傳（僅註冊指令時
-# 一次性執行，不屬於常駐服務的一部分，放同資料夾方便管理即可）
+# 將 bot_gateway.py、bot-gateway/requirements.txt（repo 裡的子資料夾，不是根目錄那份）
+# 上傳至此資料夾；若要用 Discord，也把 register_discord_commands.py 一併上傳
+# （僅註冊指令時一次性執行，不屬於常駐服務的一部分，放同資料夾方便管理即可）
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt   # 已含 pynacl，Discord 簽章驗證需要
@@ -233,7 +269,19 @@ Discord 的部分，先看到訊息顯示「思考中…」（deferred 回應）
 
 ## Step 5：邊緣節點端啟動
 
+`bootstrap.py` 現在改成讀 `edge.conf` 集中管理設定，優先順序是
+**CLI 參數 > 環境變數 > edge.conf > 預設值**，三種都可以混用：
+
+```bash
+# 方式 A：把 edge.conf 內容改好後直接跑（長期在同一台機器上管理最方便）
+# 上傳 bootstrap.py、edge.conf 到工作目錄，編輯 edge.conf 填入：
+#   ORACLE_URL、NODE_ID、NODE_API_KEY（必須跟 Step 2 登記的一致）、MODEL_NAME
+pip install -r edge-worker/requirements.txt -q
+python bootstrap.py
+```
+
 ```python
+# 方式 B：Kaggle/Colab Notebook 常用的一次性寫法，不需要另外上傳 edge.conf
 import os
 os.environ["ORACLE_URL"] = "https://<你的Oracle公開IP或網域>"
 os.environ["NODE_ID"] = "kaggle-1"          # 必須跟 Step 2 登記的一致
@@ -243,6 +291,31 @@ os.environ["MODEL_NAME"] = "qwen2.5-coder:14b"
 !pip install requests -q
 !python bootstrap.py
 ```
+
+```bash
+# 方式 C：CLI 參數臨時切換模型／節點身分（測試不同模型時最方便，不用改檔案）
+python bootstrap.py --model qwen3:8b
+python bootstrap.py --model deepseek-coder-v2:16b --node-id colab-1
+```
+
+## Step 5.5：（選用）g4f 虛擬節點——不需要 GPU 的額外運算節點
+
+`g4f_worker.py` 是另一種「節點」：不呼叫本地 Ollama，而是透過 `g4f`（gpt4free）套件轉打免費的
+第三方網頁模型端點，適合拿來當備援或測試用，**不需要顯卡、不需要另外的機器**——通常直接跟
+`server.py` 部署在同一台 Oracle 主機上，把它當成一個「虛擬」邊緣節點。
+
+```bash
+cd /home/opc/finflow-queue   # 或任何你方便管理的資料夾
+pip install -r g4f-worker-requirements.txt
+
+export G4F_NODE_API_KEY="<金鑰D，記得先照 Step 2 的方式登記進 NODE_API_KEYS_JSON>"
+python g4f_worker.py
+```
+
+**已知限制**：`g4f` 套件呼叫的是免費第三方端點，穩定性、速度、可用模型都不受你控制，
+逾時（預設 60 秒）或端點掛掉都是正常會發生的狀況，程式已經處理成「失敗就回報 error
+給佇列，讓佇列走正常的重試/DLQ 流程」，不需要额外介入。長期穩定用途還是建議以
+Ollama 邊緣節點（Step 5）為主，這個當備援。
 
 ## Step 6：驗證
 
@@ -258,13 +331,63 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 
 ## 變更紀錄摘要
 
-### v5（本次）
+### v8（本次）
+
+延續 v7 的思路（秘密值跟設定檔分離），這次把 `Caddyfile`／`setup-https.sh` 裡寫死的
+Oracle 公開 IP 也搬進 `finflow-queue.env`，理由：這兩個檔案先前都直接把真實公開 IP
+明碼寫進版本控制，公開 repo 等於公告了你的伺服器位置。
+
+| 檔案 | 變更 |
+|------|------|
+| `finflow-queue.env` | 新增 `ORACLE_PUBLIC_IP=`（空值佔位），並附註說明用途 |
+| `Caddyfile` | 方案 A 的 domain 清單從寫死的 `158.101.16.137` 改成 Caddy 原生支援的環境變數佔位符 `{$ORACLE_PUBLIC_IP}`；`10.0.0.152`（VCN 內部私有 IP，非機敏資訊）維持寫死 |
+| `setup-https.sh` | 新增「步驟 0」：從 `/home/opc/finflow-queue/finflow-queue.env` 讀取 `ORACLE_PUBLIC_IP`，沒填就直接報錯退出，不會用空值繼續跑；新增「步驟 4」：幫套件安裝的 `caddy.service` 建立 systemd drop-in（`/etc/systemd/system/caddy.service.d/override.conf`，`EnvironmentFile=` 指向同一份 env 檔），讓 Caddy 進程啟動時能讀到 `ORACLE_PUBLIC_IP` 並代入 Caddyfile 裡的 `{$ORACLE_PUBLIC_IP}`；結尾驗證用的 curl 指令改用讀到的變數，不再寫死 IP |
+| `DEPLOY.md`（本檔） | Step 2 的 `finflow-queue.env` 範例補上 `ORACLE_PUBLIC_IP`；Step 4 改寫，說明新的讀取流程與執行前置條件 |
+
+**運作原理小記**：Caddyfile 原生就支援 `{$ENV_VAR}` 這種語法在載入設定檔時代入環境變數，
+不需要額外套件；唯一麻煩的地方是 Oracle Linux 的 `caddy` 套件安裝的 `caddy.service` 是
+套件維護者提供的，我們不會、也不應該直接改動套件檔案本身，所以用 systemd 的 drop-in
+override 機制（`/etc/systemd/system/caddy.service.d/`）疊加一條 `EnvironmentFile=`，
+這是 systemd 官方支援、不會在套件更新時被覆蓋掉的做法。
+
+### v7（本次，合併 upload_files.zip 有價值的部分）
+
+這次是把兩份壓縮檔的內容合併：`ai_edge_computing-main.zip`（較新，含 Discord/GET-nodes/
+requirements.txt 修正）保留為基礎，再挑 `upload_files.zip` 裡確實比較新、比較好的部分併入。
+
+| 檔案 | 變更 |
+|------|------|
+| `bootstrap.py` | **改用新版**：從 `edge.conf` 讀取設定（`load_conf()`），優先順序 CLI 參數 > 環境變數 > edge.conf > 預設值；同時修掉了先前 v5 版本遺留的已知問題（推論例外現在會立即透過 `submit_result(error=...)` 回報，不再是整圈靜默重試）。**合併時修正**：預設 `ORACLE_URL` 原本寫死真實公開 IP，已改為佔位字串 |
+| `edge.conf`（新增） | 邊緣節點設定範本。**合併時修正**：原始版本裡的 `NODE_API_KEY`、`ORACLE_URL` 是真實外洩值，已換成佔位字串 |
+| `finflow-queue.env`（新增） | 佇列伺服器設定範本，內容本來就是空值佔位，直接沿用 |
+| `finflow-queue.service` | 改用 `EnvironmentFile=/home/opc/finflow-queue/finflow-queue.env`，取代原本內嵌明碼的 `Environment=` 寫法，真實金鑰不會再出現在會被 commit 的 unit file 裡（也是先前 `bot-gateway.service` 金鑰外洩問題的同類修法） |
+| `g4f_worker.py`（新增） | 不需要 GPU 的 g4f（gpt4free）虛擬節點。**合併時修正兩個會導致完全無法運作的 bug**：① `register_node()` 原本送巢狀 `{"capability": {...}}`，跟 `server.py` 的 `HeartbeatRequest` 扁平 schema（`platform`/`current_model`/`vram_gb`）對不起來，會被 422 拒絕，已改成送正確的扁平欄位；② 原本用 `res.json().get("job")` 解析任務，但 `GET /jobs/next` 實際回傳的是扁平的 `{"job_id":...,"payload":...}`，沒有 `"job"` 這一層，永遠拿不到任務，已修正為直接讀 `job_id`/`payload` |
+| `g4f-worker-requirements.txt`（新增） | `g4f_worker.py` 需要的 `g4f`、`requests` 套件，原本沒有對應的 requirements 檔 |
+| `DEPLOY.md`（本檔） | Step 1-3 改為搭配 `finflow-queue.env` 的部署方式；新增 Step 5 的 `edge.conf`／CLI 參數用法說明；新增 Step 5.5 說明 `g4f_worker.py` 部署方式與已知限制 |
+
+**這次沒有採用的部分**（因為比 `ai_edge_computing-main.zip` 舊，會造成功能倒退）：
+`upload_files.zip` 裡的 `server.py`、`bot_gateway.py`、`requirements.txt`、`Caddyfile`、
+`bot-gateway.service` 都維持用 `ai_edge_computing-main.zip` 的版本，沒有覆蓋。
+
+### v6（本次）
+
+| 檔案 | 變更 |
+|------|------|
+| `server.py` | 補回 `GET /nodes` 監控端點（`main.py` 原本有，`server.py` 重構時漏掉）；回傳格式對應新版扁平化 `nodes` schema，組成巢狀 `capability` 物件維持對舊呼叫端相容 |
+| `requirements.txt` | **修正誤植**：這份原本其實是 bot-gateway 專用依賴（`fastapi`/`uvicorn`/`httpx`/`pynacl`），長期放在根目錄，導致 `server.py` 實際需要的 `requests`（Telegram 通知用）、`pydantic` 版本鎖定沒有被追蹤。改回 `fastapi`/`uvicorn`/`pydantic`/`requests` |
+| `bot-gateway/requirements.txt`（新增） | 原本誤放在根目錄的 bot-gateway 依賴，移到專屬子資料夾 |
+| `bot-gateway.service` | **安全性修正**：移除誤上傳進版本庫的真實 `CLIENT_API_KEY` 明碼，改回 `change-me-to-your-own-client-secret` 佔位字串（該金鑰已外洩，實機上務必重新產生新金鑰並更新 `finflow-queue.service`／`bot-gateway.service`，兩邊都要同步改）；`Description` 補上 Discord 說明 |
+| `Caddyfile` | 方案 B（自訂網域）範例區塊補上遺漏的 `/discord/*` 路由——原本只有 `/telegram/*`、`/line/*`，但 Discord 恰好是唯一「必須用方案 B 或 C」的平台，範例卻沒示範，屬邏輯疏漏 |
+| `DEPLOY.md`（本檔） | Step 1／`finflow-queue.service` 範例路徑統一改為 `/home/opc`（原本殘留 `/home/ubuntu`，跟 bot-gateway 段落、跟 repo 裡實際的 `finflow-queue.service`／`bot-gateway.service` 不一致）；移除 heredoc 內重複的 `WorkingDirectory=` 行；移除 Ubuntu `apt` 安裝指令（環境已確認是 Oracle Linux，一律用 venv 即可） |
+| （移除）`finflow-bot-gateway-updates.zip` | 先前對話產生的暫存壓縮檔被誤含在 repo 裡，予以移除，避免內容跟實際檔案不同步造成混淆 |
+
+### v5
 
 | 檔案 | 變更 |
 |------|------|
 | `bot_gateway.py` | 新增 Discord 支援：`POST /discord/interactions` 端點，Ed25519 簽章驗證（`DISCORD_PUBLIC_KEY`）、Slash Command `/ask` 的 deferred 回應 + 背景任務 + interaction token followup 編輯訊息 |
 | `register_discord_commands.py`（新增） | 一次性腳本，呼叫 Discord API 註冊 `/ask` 這個 Slash Command（Global 或指定 Guild） |
-| `requirements.txt` | 新增 `pynacl`（Discord Ed25519 簽章驗證需要） |
+| `requirements.txt` | 新增 `pynacl`（Discord Ed25519 簽章驗證需要）——**此條目在 v6 已修正為誤植，詳見上方 v6 說明** |
 | `bot-gateway.service` | 新增 `DISCORD_PUBLIC_KEY` 環境變數 |
 | `Caddyfile` | 註解更新：`/discord/*` 路由現在有實際服務接手；補充 Discord Interactions Endpoint 不接受自簽憑證（方案 A）的限制 |
 | `DEPLOY.md`（本檔） | 新增「建立 Discord Bot」小節；補充 Oracle Linux 上 `EnvironmentFile=` 搭配 SELinux 的已知問題與修法（實際部署時遇到並排除） |

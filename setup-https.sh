@@ -6,8 +6,26 @@
 # 執行前提：
 #   1. server.py 已透過 systemd 服務啟動（uvicorn --host 127.0.0.1 --port 8000）
 #   2. 已將本目錄的 Caddyfile 上傳到 Oracle VM
+#   3. /home/opc/finflow-queue/finflow-queue.env 已存在，且已填入 ORACLE_PUBLIC_IP
+#      （真實公開 IP 不寫死在 Caddyfile／本腳本裡，改從這份不進版本控制的 env
+#      檔讀取，避免又發生跟先前 bot-gateway.service 金鑰一樣的外洩問題）
 
 set -e
+
+ENV_FILE="/home/opc/finflow-queue/finflow-queue.env"
+
+echo "=== 步驟 0：讀取 Oracle 公開 IP（來自 finflow-queue.env） ==="
+if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR：找不到 $ENV_FILE，請先照 DEPLOY.md 的 Step 2 建立這個檔案"
+    exit 1
+fi
+
+ORACLE_PUBLIC_IP=$(grep -E '^ORACLE_PUBLIC_IP=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '[:space:]')
+if [ -z "$ORACLE_PUBLIC_IP" ]; then
+    echo "ERROR：$ENV_FILE 裡的 ORACLE_PUBLIC_IP 是空的，請先填入你的 Oracle 公開 IP 再重新執行"
+    exit 1
+fi
+echo "使用的公開 IP：$ORACLE_PUBLIC_IP"
 
 echo "=== 步驟 1：確認 dnf 環境 ==="
 sudo dnf makecache --quiet
@@ -28,14 +46,24 @@ if [ ! -f Caddyfile ]; then
 fi
 sudo cp Caddyfile /etc/caddy/Caddyfile
 
-echo "=== 步驟 4：啟動並設定 Caddy 開機自啟 ==="
+echo "=== 步驟 4：讓 Caddy 服務讀得到 ORACLE_PUBLIC_IP ==="
+# Caddyfile 裡用 {$ORACLE_PUBLIC_IP} 引用這個環境變數，但 caddy 套件安裝的
+# caddy.service 預設不會載入 finflow-queue.env，這裡用 drop-in override 補上
+sudo mkdir -p /etc/systemd/system/caddy.service.d
+sudo tee /etc/systemd/system/caddy.service.d/override.conf > /dev/null << EOF
+[Service]
+EnvironmentFile=$ENV_FILE
+EOF
+sudo systemctl daemon-reload
+
+echo "=== 步驟 5：啟動並設定 Caddy 開機自啟 ==="
 sudo systemctl enable caddy
 sudo systemctl restart caddy
 sleep 2
 sudo systemctl status caddy --no-pager
 
 echo ""
-echo "=== 步驟 5：OS 層防火牆開放 443 ==="
+echo "=== 步驟 6：OS 層防火牆開放 443 ==="
 sudo firewall-cmd --permanent --add-service=https
 sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --reload
@@ -53,4 +81,4 @@ echo "    Destination Port Range: 443"
 echo ""
 echo "設定完成後執行驗證："
 echo "  curl -k https://127.0.0.1/healthz"
-echo "  curl -k https://158.101.16.137/healthz"
+echo "  curl -k https://$ORACLE_PUBLIC_IP/healthz"

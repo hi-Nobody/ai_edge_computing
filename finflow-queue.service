@@ -5,11 +5,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/home/opc/finflow-queue
-Environment=CLIENT_API_KEY=change-me-to-your-own-client-secret
-Environment=NODE_API_KEYS_JSON={"kaggle-1":"change-me-A","lightning-1":"change-me-B","colab-1":"change-me-C"}
-Environment=QUEUE_DB_PATH=/home/opc/finflow-queue/finflow_queue.db
-Environment=TELEGRAM_BOT_TOKEN=
-Environment=TELEGRAM_CHAT_ID=
+EnvironmentFile=/home/opc/finflow-queue/finflow-queue.env
 ExecStart=/home/opc/finflow-queue/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5

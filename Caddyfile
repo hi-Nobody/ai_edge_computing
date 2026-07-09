@@ -18,9 +18,13 @@
 # ============================================================
 # 方案 A（零成本，預設）：自簽憑證，綁定 Oracle 公開 IP
 # 適合：不想花錢買網域、可接受邊緣節點端用 verify=False 連線
+#
+# {$ORACLE_PUBLIC_IP} 是從 finflow-queue.env 讀進來的環境變數（見
+# setup-https.sh 步驟 0、4），真實 IP 不寫死在這個會被 commit 的檔案裡。
+# 10.0.0.152 是 VCN 內部私有 IP，非機敏資訊，維持寫死無妨。
 # ============================================================
 
-127.0.0.1, 10.0.0.152, 158.101.16.137 {
+127.0.0.1, 10.0.0.152, {$ORACLE_PUBLIC_IP} {
 	tls internal
 
 	handle /telegram/* {
@@ -50,6 +54,9 @@
 # 		reverse_proxy 127.0.0.1:8001
 # 	}
 # 	handle /line/* {
+# 		reverse_proxy 127.0.0.1:8001
+# 	}
+# 	handle /discord/* {
 # 		reverse_proxy 127.0.0.1:8001
 # 	}
 # 	handle {
