@@ -2,7 +2,7 @@
 #
 # 更新說明：/telegram/*、/line/*、/discord/* 原本指向的 127.0.0.1:8001 沒有
 # 任何服務在監聽（或未實作），現在已補上 bot-gateway/bot_gateway.py（見
-# bot-gateway/ 目錄），這三條路由可以正常使用了。若尚未部署 bot-gateway，
+# ui-bot/ 目錄），這三條路由可以正常使用了。若尚未部署 ui-bot，
 # 這幾段會回 502，屬預期行為。
 #
 # 注意：Discord 的 Interactions Endpoint 驗證只接受受信任 CA 簽發的憑證，

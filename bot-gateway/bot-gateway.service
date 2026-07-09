@@ -1,0 +1,24 @@
+[Unit]
+Description=FinFlow Bot Gateway (Telegram/LINE/Discord webhook middleware)
+After=network.target finflow-queue.service
+Requires=finflow-queue.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/opc/ui-bot
+# 機敏設定（CLIENT_API_KEY、TELEGRAM/LINE/DISCORD 相關金鑰）統一從
+# finflow-queue.env 讀取，跟 finflow-queue.service 共用同一份，避免
+# CLIENT_API_KEY 兩邊改到不一致、也避免金鑰明碼散落在多個 systemd unit 裡。
+EnvironmentFile=/home/opc/finflow-queue/finflow-queue.env
+# 以下是非機敏的部署參數，不涉及金鑰，留在這裡即可，不需要進 env 檔
+Environment=ORACLE_INTERNAL_URL=http://127.0.0.1:8000
+Environment=GATEWAY_DB_PATH=/home/opc/ui-bot/bot_gateway.db
+Environment=JOB_WAIT_TIMEOUT_SEC=900
+Environment=HISTORY_MAX_MESSAGES=20
+ExecStart=/home/opc/ui-bot/venv/bin/uvicorn bot_gateway:app --host 127.0.0.1 --port 8001
+Restart=always
+RestartSec=5
+User=opc
+
+[Install]
+WantedBy=multi-user.target
