@@ -10,6 +10,7 @@ FinFlow 任務佇列伺服器 v4 —— 在 Oracle Cloud 上運行
   5. 補回 /jobs/aggregate 彙整端點
   6. 補回 Session 自動壓縮（避免長對話 context 無限增長）
   7. 補回 POST /jobs + GET /jobs/{id} 給進階 DAG 編排腳本使用
+  8. 補回 GET /nodes 監控端點（原版重構時遺漏，導致沒有任何方式查詢節點存活狀態）
 
 啟動方式：
     pip install fastapi uvicorn pydantic requests
@@ -504,6 +505,32 @@ def node_heartbeat(data: HeartbeatRequest, x_api_key: str = Header(None)):
     conn.commit()
     conn.close()
     return {"status": "ok"}
+
+
+@app.get("/nodes", dependencies=[Depends(verify_client_key)])
+def list_nodes():
+    """列出所有已註冊節點、是否存活、能力資訊——監控用端點。
+    舊版（main.py）用單一 capability JSON 欄位；本版 nodes 表已改成扁平化欄位
+    （platform/current_model/vram_gb，見 node_capability_satisfies() 的設計說明），
+    這裡回傳時組成對稱的巢狀 capability 物件，維持 API 回應格式對舊呼叫端相容。"""
+    cutoff = time.time() - NODE_DEAD_AFTER_SEC
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM nodes").fetchall()
+    conn.close()
+    return [
+        {
+            "node_id": r["node_id"],
+            "alive": r["last_heartbeat"] > cutoff,
+            "last_heartbeat": r["last_heartbeat"],
+            "capability": {
+                "platform": r["platform"],
+                "model": r["current_model"],
+                "vram_gb": r["vram_gb"],
+            },
+        }
+        for r in rows
+    ]
 
 
 # ---------- 10. 背景容錯巡檢（修正問題一：補回自動執行緒；修正問題四：補上串聯失敗）----------

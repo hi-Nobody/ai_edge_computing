@@ -1,4 +1,4 @@
-# FinFlow 分散式邊緣運算系統部署指南（v8，公開 IP 改由 finflow-queue.env 集中管理後）
+# FinFlow 分散式邊緣運算系統部署指南（v9，邊緣運算檔案整理進 edge-worker/ 後）
 
 > 本文件取代前一版 DEPLOY.md。主要差異：改用 venv 部署（迴避 Ubuntu 新版 pip 限制）、
 > 檔名由 main.py 改為 server.py、**不需要額外設定 cron**（維護邏輯已改回自動背景執行緒）、
@@ -7,7 +7,9 @@
 > （支援 CLI 參數臨時覆蓋，見「Step 5」）、**新增 `g4f_worker.py` 虛擬節點**（不需要 GPU，
 > 用 g4f 逆向 API 當作額外一個運算節點，見「Step 5.5」）、**`Caddyfile`／`setup-https.sh`
 > 的 Oracle 公開 IP 改從 `finflow-queue.env` 的 `ORACLE_PUBLIC_IP` 讀取**，不再寫死在會被
-> commit 的檔案裡（見「Step 4」）。
+> commit 的檔案裡（見「Step 4」）、**邊緣運算相關檔案（`bootstrap.py`／`edge.conf`／
+> `g4f_worker.py`）整理進 `edge-worker/` 資料夾**，`server.py` 恢復 `GET /nodes` 監控端點，
+> `requirements.txt` 依實際服務對象拆分成根目錄（`server.py` 用）與 `bot-gateway/`（`bot_gateway.py` 用）兩份。
 >
 > 另外根據實際部署經驗補充：本文件範例路徑統一使用 `/home/opc`（OCI 預設使用者）。
 > 若你在 **Oracle Linux** 上部署，實測會遇到 **SELinux**
@@ -269,15 +271,21 @@ Discord 的部分，先看到訊息顯示「思考中…」（deferred 回應）
 
 ## Step 5：邊緣節點端啟動
 
-`bootstrap.py` 現在改成讀 `edge.conf` 集中管理設定，優先順序是
-**CLI 參數 > 環境變數 > edge.conf > 預設值**，三種都可以混用：
+`bootstrap.py`、`edge.conf`、`g4f_worker.py`、`requirements.txt` 都收在 repo 的
+`edge-worker/` 資料夾裡。`bootstrap.py` 讀 `edge.conf` 集中管理設定，優先順序是
+**CLI 參數 > 環境變數 > edge.conf > 預設值**，三種都可以混用；`load_conf()` 預設
+會找「跟 `bootstrap.py` 同一個資料夾」下的 `edge.conf`，不管你是保留
+`edge-worker/` 這層結構、還是只把這兩個檔案單獨複製到 Kaggle/Colab 的工作目錄，
+都一樣找得到：
 
 ```bash
 # 方式 A：把 edge.conf 內容改好後直接跑（長期在同一台機器上管理最方便）
-# 上傳 bootstrap.py、edge.conf 到工作目錄，編輯 edge.conf 填入：
+# 從 repo 的 edge-worker/ 資料夾把 bootstrap.py、edge.conf 一起複製到工作目錄
+# （兩個檔案要放在同一層，不用管理它是不是還在 edge-worker/ 底下），
+# 編輯 edge.conf 填入：
 #   ORACLE_URL、NODE_ID、NODE_API_KEY（必須跟 Step 2 登記的一致）、MODEL_NAME
 pip install -r edge-worker/requirements.txt -q
-python bootstrap.py
+python edge-worker/bootstrap.py
 ```
 
 ```python
@@ -300,21 +308,22 @@ python bootstrap.py --model deepseek-coder-v2:16b --node-id colab-1
 
 ## Step 5.5：（選用）g4f 虛擬節點——不需要 GPU 的額外運算節點
 
-`g4f_worker.py` 是另一種「節點」：不呼叫本地 Ollama，而是透過 `g4f`（gpt4free）套件轉打免費的
-第三方網頁模型端點，適合拿來當備援或測試用，**不需要顯卡、不需要另外的機器**——通常直接跟
-`server.py` 部署在同一台 Oracle 主機上，把它當成一個「虛擬」邊緣節點。
+`g4f_worker.py`（在 `edge-worker/` 資料夾裡）是另一種「節點」：不呼叫本地 Ollama，
+而是透過 `g4f`（gpt4free）套件轉打免費的第三方網頁模型端點，適合拿來當備援或測試用，
+**不需要顯卡、不需要另外的機器**——通常直接跟 `server.py` 部署在同一台 Oracle 主機上，
+把它當成一個「虛擬」邊緣節點。
 
 ```bash
 cd /home/opc/finflow-queue   # 或任何你方便管理的資料夾
-pip install -r g4f-worker-requirements.txt
+pip install -r edge-worker/requirements.txt   # 已含 g4f、requests
 
 export G4F_NODE_API_KEY="<金鑰D，記得先照 Step 2 的方式登記進 NODE_API_KEYS_JSON>"
-python g4f_worker.py
+python edge-worker/g4f_worker.py
 ```
 
 **已知限制**：`g4f` 套件呼叫的是免費第三方端點，穩定性、速度、可用模型都不受你控制，
 逾時（預設 60 秒）或端點掛掉都是正常會發生的狀況，程式已經處理成「失敗就回報 error
-給佇列，讓佇列走正常的重試/DLQ 流程」，不需要额外介入。長期穩定用途還是建議以
+給佇列，讓佇列走正常的重試/DLQ 流程」，不需要額外介入。長期穩定用途還是建議以
 Ollama 邊緣節點（Step 5）為主，這個當備援。
 
 ## Step 6：驗證
@@ -330,6 +339,40 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v9（本次）
+
+這次上傳的репо快照裡，`server.py`／`requirements.txt`／`bot-gateway.service` 這三個檔案
+其實是接在比較舊的基礎上（沒有 v6 的修正），所以先重新補上這幾個修正，另外處理你提出的
+兩個新問題（邊緣運算相關檔案盤點、搬進 `edge-worker/`）。
+
+| 檔案 | 變更 |
+|------|------|
+| `server.py` | 補回 `GET /nodes` 監控端點（這次上傳的版本又缺了這個，v6 修過的東西被沖掉了，重新補上） |
+| `requirements.txt` | 重新拆分：根目錄改回 `fastapi`/`uvicorn`/`pydantic`/`requests`（`server.py` 用），原本誤植的 bot-gateway 依賴移到 `bot-gateway/requirements.txt` |
+| `bot-gateway/requirements.txt`（新增） | 承接上一項，內容為 `fastapi`/`uvicorn`/`httpx`/`pynacl` |
+| `bot-gateway.service` | 重新修正：移除又出現的真實 `CLIENT_API_KEY` 明碼（改回佔位字串）；`Description` 補上 Discord 說明 |
+| （移除）`finflow-bot-gateway-updates.zip` | 又混進 repo 的暫存檔，再次移除 |
+| `edge-worker/bootstrap.py`（搬移） | 從根目錄搬進 `edge-worker/`；`load_conf()` 預設路徑改成「跟 `bootstrap.py` 同一資料夾」而非「目前工作目錄」，這樣不管保留 `edge-worker/` 結構或單獨複製到 Kaggle/Colab 工作目錄都找得到 `edge.conf` |
+| `edge-worker/edge.conf`（搬移） | 從根目錄搬進 `edge-worker/`，內容不變 |
+| `edge-worker/g4f_worker.py`（搬移） | 從根目錄搬進 `edge-worker/`；沒有讀外部設定檔，搬移不影響行為 |
+| `edge-worker/requirements.txt` | 位置不變（本來就在這個資料夾），內容已包含 `requests`、`g4f` |
+| `DEPLOY.md`（本檔） | 升級至 v9；Step 5／5.5 的路徑改為 `edge-worker/bootstrap.py`、`edge-worker/g4f_worker.py`、`edge-worker/requirements.txt` |
+
+**問題1 回答**——除了 `bootstrap.py`、`edge.conf`，屬於邊緣運算（跑在 Kaggle/Colab/Lightning
+或作為虛擬節點）的檔案還有：`g4f_worker.py`（不需要 GPU 的虛擬節點，跟 `bootstrap.py` 一樣會呼叫
+`/nodes/heartbeat`、`/jobs/next`、`/jobs/{id}/result`）、`edge-worker/requirements.txt`
+（這兩支程式共用的依賴清單）。`server.py`、`bot_gateway.py`、`register_discord_commands.py`、
+`Caddyfile`、`setup-https.sh`、`finflow-queue.service`、`finflow-queue.env`、
+`bot-gateway.service` 都是核心端／閘道端，不屬於邊緣運算範疇，沒有搬動。
+
+**問題2 回答**——只有 `bootstrap.py` 需要改路徑相依性：它原本用相對路徑 `"edge.conf"` 找設定檔，
+相對的是「執行時的目前工作目錄」，不是「檔案自己的位置」。搬進 `edge-worker/` 後，如果你在
+repo 根目錄執行 `python edge-worker/bootstrap.py`，目前工作目錄是根目錄，相對路徑
+`"edge.conf"` 會去根目錄找，那裡已經沒有這個檔案了，會找不到、悄悄用預設值跑（不會報錯，
+但設定形同沒生效，是個容易忽略的地雷）。已修正為用 `os.path.dirname(os.path.abspath(__file__))`
+算出 `bootstrap.py` 自己的所在目錄，不管從哪裡呼叫都找得到同目錄下的 `edge.conf`。
+`g4f_worker.py`、`edge-worker/requirements.txt` 沒有路徑相依問題，搬移不影響行為。
 
 ### v8（本次）
 

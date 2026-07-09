@@ -1,5 +1,5 @@
 [Unit]
-Description=FinFlow Bot Gateway (Telegram/LINE webhook middleware)
+Description=FinFlow Bot Gateway (Telegram/LINE/Discord webhook middleware)
 After=network.target finflow-queue.service
 Requires=finflow-queue.service
 
@@ -7,7 +7,7 @@ Requires=finflow-queue.service
 Type=simple
 WorkingDirectory=/home/opc/bot-gateway
 Environment=ORACLE_INTERNAL_URL=http://127.0.0.1:8000
-Environment=CLIENT_API_KEY=c6b17d1af7b812d5badf313319724aa3
+Environment=CLIENT_API_KEY=change-me-to-your-own-client-secret
 Environment=TELEGRAM_BOT_TOKEN=
 Environment=TELEGRAM_WEBHOOK_SECRET=
 Environment=LINE_CHANNEL_SECRET=
