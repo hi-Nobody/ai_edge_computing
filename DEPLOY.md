@@ -365,7 +365,7 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 
 | 檔案 | 變更 |
 |------|------|
-| `bot-gateway/`（新增資料夾） | 把 `bot_gateway.py`、`bot-gateway.service`、`register_discord_commands.py`、bot 專用 `requirements.txt` 四個檔案整理進同一個資料夾，跟根目錄的 Oracle 核心端程式（`server.py`）分開，也跟 `edge-worker/` 的邊緣節點程式分開。原本 `requirements.txt` 是放在 `bot-gateway/requirements.txt` 子資料夾，現在直接扁平化放進 `bot-gateway/requirements.txt`（因為整個 `bot-gateway/` 資料夾本身就已經是「bot 閘道專用」的範圍，不需要再多一層子資料夾） |
+| `bot-gateway/`（新增資料夾） | 把 `bot_gateway.py`、`bot-gateway.service`、`register_discord_commands.py`、bot 專用 `requirements.txt` 四個檔案整理進同一個資料夾，跟根目錄的 Oracle 核心端程式（`server.py`）分開，也跟 `edge-worker/` 的邊緣節點程式分開。四個檔案原本散落在根目錄，現在統一收進 `bot-gateway/` 底下（`requirements.txt` 直接放在這一層，不需要再多一層子資料夾） |
 | `bot-gateway.service` | 路徑改為 `/home/opc/bot-gateway`（`WorkingDirectory`／`GATEWAY_DB_PATH`／`ExecStart`）。systemd 服務名稱維持 `bot-gateway.service` 不變（`systemctl status bot-gateway` 等指令不受影響），只有部署目錄跟著 repo 結構調整 |
 | `Caddyfile` | 註解裡的 `bot-gateway/` 路徑說明更新為 `bot-gateway/`（純文字說明，`reverse_proxy 127.0.0.1:8001` 這個實際轉發目標不受資料夾搬家影響） |
 | `finflow-queue.env` | 補上 `TELEGRAM_WEBHOOK_SECRET`、`LINE_CHANNEL_SECRET`、`LINE_CHANNEL_ACCESS_TOKEN`、`DISCORD_PUBLIC_KEY`，讓 `bot-gateway.service` 的機敏設定也能從這份共用檔案讀取 |
