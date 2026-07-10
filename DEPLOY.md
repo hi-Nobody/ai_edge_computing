@@ -1,4 +1,4 @@
-# FinFlow 分散式邊緣運算系統部署指南（v10，bot 閘道相關檔案整理進 bot-gateway/ 後）
+# FinFlow 分散式邊緣運算系統部署指南（v11，修正 g4f_worker.py 路徑文件與實際不符）
 
 > 本文件取代前一版 DEPLOY.md。主要差異：改用 venv 部署（迴避 Ubuntu 新版 pip 限制）、
 > 檔名由 main.py 改為 server.py、**不需要額外設定 cron**（維護邏輯已改回自動背景執行緒）、
@@ -7,8 +7,9 @@
 > （支援 CLI 參數臨時覆蓋，見「Step 5」）、**新增 `g4f_worker.py` 虛擬節點**（不需要 GPU，
 > 用 g4f 逆向 API 當作額外一個運算節點，見「Step 5.5」）、**`Caddyfile`／`setup-https.sh`
 > 的 Oracle 公開 IP 改從 `finflow-queue.env` 的 `ORACLE_PUBLIC_IP` 讀取**，不再寫死在會被
-> commit 的檔案裡（見「Step 4」）、**邊緣運算相關檔案（`bootstrap.py`／`edge.conf`／
-> `g4f_worker.py`）整理進 `edge-worker/` 資料夾**，`server.py` 恢復 `GET /nodes` 監控端點、
+> commit 的檔案裡（見「Step 4」）、**邊緣運算相關檔案（`bootstrap.py`／`edge.conf`）整理進
+> `edge-worker/` 資料夾**（`g4f_worker.py` 維持在根目錄，跟 `server.py` 共用同一個 venv，
+> 見「Step 5.5」的說明），`server.py` 恢復 `GET /nodes` 監控端點、
 > **`bot_gateway.py`／`bot-gateway.service`／`register_discord_commands.py`／
 > bot 專用 `requirements.txt` 四個檔案整理進 `bot-gateway/` 資料夾**（見「Step 4.5」，VM 上的
 > 部署路徑同步從 `/home/opc/ui-bot` 改為 `/home/opc/bot-gateway`）、`bot-gateway.service`
@@ -292,8 +293,9 @@ Discord 的部分，先看到訊息顯示「思考中…」（deferred 回應）
 
 ## Step 5：邊緣節點端啟動
 
-`bootstrap.py`、`edge.conf`、`g4f_worker.py`、`requirements.txt` 都收在 repo 的
-`edge-worker/` 資料夾裡。`bootstrap.py` 讀 `edge.conf` 集中管理設定，優先順序是
+`bootstrap.py`、`edge.conf`、`requirements.txt` 都收在 repo 的
+`edge-worker/` 資料夾裡（`g4f_worker.py` 不在這裡，見下方 Step 5.5 的說明）。
+`bootstrap.py` 讀 `edge.conf` 集中管理設定，優先順序是
 **CLI 參數 > 環境變數 > edge.conf > 預設值**，三種都可以混用；`load_conf()` 預設
 會找「跟 `bootstrap.py` 同一個資料夾」下的 `edge.conf`，不管你是保留
 `edge-worker/` 這層結構、還是只把這兩個檔案單獨複製到 Kaggle/Colab 的工作目錄，
@@ -329,17 +331,21 @@ python bootstrap.py --model deepseek-coder-v2:16b --node-id colab-1
 
 ## Step 5.5：（選用）g4f 虛擬節點——不需要 GPU 的額外運算節點
 
-`g4f_worker.py`（在 `edge-worker/` 資料夾裡）是另一種「節點」：不呼叫本地 Ollama，
-而是透過 `g4f`（gpt4free）套件轉打免費的第三方網頁模型端點，適合拿來當備援或測試用，
-**不需要顯卡、不需要另外的機器**——通常直接跟 `server.py` 部署在同一台 Oracle 主機上，
-把它當成一個「虛擬」邊緣節點。
+`g4f_worker.py`（在 repo **根目錄**，不在 `edge-worker/` 底下——因為它通常直接跟
+`server.py` 部署在同一台 Oracle 主機上，用的是根目錄 `requirements.txt` 的環境，
+不是邊緣節點那份）是另一種「節點」：不呼叫本地 Ollama，而是透過 `g4f`（gpt4free）
+套件轉打免費的第三方網頁模型端點，適合拿來當備援或測試用，**不需要顯卡、不需要
+另外的機器**。
 
 ```bash
-cd /home/opc/finflow-queue   # 或任何你方便管理的資料夾
-pip install -r edge-worker/requirements.txt   # 已含 g4f、requests
+cd /home/opc/finflow-queue   # 假設你把 g4f_worker.py 放在跟 server.py 同一個資料夾
+# requirements.txt 這裡指的是根目錄那份（已含 g4f、requests），
+# 如果你是接著 Step 1 建好的同一個 venv 繼續用，通常已經裝過了；
+# 是新開的 venv 才需要重新 pip install -r requirements.txt
+source venv/bin/activate
 
 export G4F_NODE_API_KEY="<金鑰D，記得先照 Step 2 的方式登記進 NODE_API_KEYS_JSON>"
-python edge-worker/g4f_worker.py
+python g4f_worker.py
 ```
 
 **已知限制**：`g4f` 套件呼叫的是免費第三方端點，穩定性、速度、可用模型都不受你控制，
@@ -360,6 +366,21 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v11（本次）
+
+你把 `/home/opc/finflow-queue/bot-gateway` 搬到 `/home/opc/bot-gateway` 這個操作本身是對的、
+不會有其他路徑問題——`bot-gateway.service` 裡的 `WorkingDirectory`／`GATEWAY_DB_PATH`／
+`ExecStart` 本來就是寫 `/home/opc/bot-gateway`（跟 repo 裡 `bot-gateway/` 資料夾同名，容易
+混淆，但兩者是不同層級的東西：一個是 repo 裡收納原始碼的資料夾，一個是實機上的部署路徑），
+搬完之後兩邊就對上了。順便做了一次全檔案覆核，發現一個文件跟實際檔案結構不一致的問題：
+
+| 檔案 | 問題 | 修正 |
+|------|------|------|
+| `DEPLOY.md`（本檔） | Step 5／5.5 說 `g4f_worker.py` 收在 `edge-worker/` 資料夾、要用 `edge-worker/requirements.txt`（並宣稱裡面含 `g4f`）；但實際上 `g4f_worker.py` 是在**根目錄**，`g4f` 套件也是加在**根目錄的 `requirements.txt`**，`edge-worker/requirements.txt` 只有 `requests`。照原本的文件操作會裝錯 `requirements.txt`、也會找不到檔案 | Step 5 的資料夾清單移除 `g4f_worker.py`；Step 5.5 改成引用根目錄的 `g4f_worker.py`、根目錄 `requirements.txt`，並補充說明「這支程式通常跟 `server.py` 共用同一個 venv」的設計理由；檔頭 intro 的敘述同步修正 |
+
+（`bootstrap.py`、`edge.conf`、`edge-worker/requirements.txt` 的路徑說明本來就是對的，沒有動；
+`bot-gateway/` 資料夾本身、`bot-gateway.service` 的路徑設定這輪檢查下來也都正確，不需要修改。）
 
 ### v10（本次）
 
