@@ -11,7 +11,7 @@
 > `g4f_worker.py`）整理進 `edge-worker/` 資料夾**，`server.py` 恢復 `GET /nodes` 監控端點、
 > **`bot_gateway.py`／`bot-gateway.service`／`register_discord_commands.py`／
 > bot 專用 `requirements.txt` 四個檔案整理進 `bot-gateway/` 資料夾**（見「Step 4.5」，VM 上的
-> 部署路徑同步從 `/home/opc/bot-gateway` 改為 `/home/opc/bot-gateway`）、`bot-gateway.service`
+> 部署路徑同步從 `/home/opc/ui-bot` 改為 `/home/opc/bot-gateway`）、`bot-gateway.service`
 > 改用 `EnvironmentFile` 讀取 `finflow-queue.env`，不再把金鑰明碼寫在 unit file 裡（跟
 > `finflow-queue.service` 同一套修法，兩個服務現在共用同一份機敏設定檔）。
 >

@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-httpx
-pynacl
+pydantic
+requests
 g4f
