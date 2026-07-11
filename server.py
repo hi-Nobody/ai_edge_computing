@@ -39,7 +39,7 @@ NODE_API_KEYS: Dict[str, str] = json.loads(os.environ.get("NODE_API_KEYS_JSON", 
 JOB_CLAIM_TIMEOUT_SEC = 300
 JOB_MAX_RETRY = 3
 NODE_DEAD_AFTER_SEC = 60
-LONG_POLL_TIMEOUT_SEC = 200
+LONG_POLL_TIMEOUT_SEC = 90
 NOTIFY_COOLDOWN_SEC = 1800
 PENDING_TOO_LONG_SEC = 180
 SESSION_COMPACT_THRESHOLD = int(os.environ.get("SESSION_COMPACT_THRESHOLD", "20"))
@@ -424,21 +424,11 @@ def submit_job(req: JobSubmitRequest):
     return {"job_id": job_id}
 
 
-@app.get("/jobs/{job_id}", dependencies=[Depends(verify_client_key)])
-def get_job_status(job_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT id, status, result, error, depends_on FROM jobs WHERE id=?", (job_id,)).fetchone()
-    conn.close()
-    if row is None:
-        raise HTTPException(status_code=404, detail="job not found")
-    return {
-        "id": row["id"], "status": row["status"], "result": row["result"], "error": row["error"],
-        "depends_on": json.loads(row["depends_on"]) if row["depends_on"] else None,
-    }
-
-
 # ---------- 9. 邊緣節點通訊端點 ----------
+# 注意：/jobs/next 必須宣告在 /jobs/{job_id} 之前！
+# FastAPI 依宣告順序比對路由，/jobs/{job_id} 是萬用路徑，若排在前面會把
+# GET /jobs/next 誤判成 job_id="next"，導致節點端請求被導去 verify_client_key
+# 驗證（而非節點自己的 verify_node_key），節點端永遠拿不到任務、一律 401。
 
 @app.get("/jobs/next")
 def get_next_job(node_id: str, x_api_key: str = Header(None)):
@@ -478,6 +468,20 @@ def get_next_job(node_id: str, x_api_key: str = Header(None)):
 
     conn.close()
     return {"message": "No pending jobs"}
+
+
+@app.get("/jobs/{job_id}", dependencies=[Depends(verify_client_key)])
+def get_job_status(job_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT id, status, result, error, depends_on FROM jobs WHERE id=?", (job_id,)).fetchone()
+    conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {
+        "id": row["id"], "status": row["status"], "result": row["result"], "error": row["error"],
+        "depends_on": json.loads(row["depends_on"]) if row["depends_on"] else None,
+    }
 
 
 @app.post("/jobs/{job_id}/result")
