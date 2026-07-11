@@ -77,6 +77,9 @@ CONFIG = {
     "MODEL_NAME":    resolve(ARGS.model,      "MODEL_NAME",    "MODEL_NAME",    "qwen2.5-coder:14b"),
     "OLLAMA_URL":    resolve(None,            "OLLAMA_URL",    "OLLAMA_URL",    "http://localhost:11434"),
     "VERIFY_TLS":    resolve(None,            "VERIFY_TLS",    "VERIFY_TLS",    "false").lower() == "true",
+    # 閒置超過這麼多秒沒有領到任何任務，就自動結束 process（釋放 Kaggle/Colab GPU 配額）。
+    # 設為 0 或負數 = 停用自動停止，永遠跑下去（維持舊行為）。
+    "IDLE_STOP_SEC": int(resolve(None,        "IDLE_STOP_SEC", "IDLE_STOP_SEC", "1800")),
 }
 
 NODE_ID = CONFIG["NODE_ID"]
@@ -149,9 +152,12 @@ def ensure_model(model_name: str):
     subprocess.run(["ollama", "pull", model_name], check=True)
 
 
+_OLLAMA_PROC = None
+
 def start_ollama_and_wait(timeout_sec=60):
+    global _OLLAMA_PROC
     log.info("啟動 Ollama 服務...")
-    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _OLLAMA_PROC = subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         try:
@@ -206,11 +212,39 @@ def submit_result(job_id: str, result=None, error=None):
         verify=CONFIG["VERIFY_TLS"],
     )
 
+# ─── 8.5 優雅關閉（自動閒置停止 / 手動停止共用）────────────────────────────
+
+def shutdown(reason: str):
+    log.info(f"節點準備停止：{reason}")
+    if _OLLAMA_PROC is not None:
+        try:
+            _OLLAMA_PROC.terminate()
+            _OLLAMA_PROC.wait(timeout=10)
+        except Exception as e:
+            log.warning(f"關閉 Ollama 行程時發生例外（忽略）：{e}")
+    log.info("節點已停止，process 即將結束")
+    sys.exit(0)
+
+
+import signal
+
+def _handle_signal(signum, frame):
+    shutdown(f"收到系統訊號 {signum}（手動停止）")
+
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
 # ─── 9. 主輪詢迴圈（含自動重啟監督）───────────────────────────────────────
 
 def worker_loop(vram_gb):
     log.info(f"進入主輪詢迴圈（模型：{CONFIG['MODEL_NAME']}）")
+    if CONFIG["IDLE_STOP_SEC"] > 0:
+        log.info(f"閒置自動停止已啟用：連續 {CONFIG['IDLE_STOP_SEC']} 秒沒有任務就會自動結束節點")
+    else:
+        log.info("閒置自動停止已停用（IDLE_STOP_SEC <= 0），節點會持續運行")
+
     loop_count = 0
+    last_activity_at = time.time()  # 一開始就算「活躍」，避免節點剛啟動就被判定閒置
     while True:
         try:
             if loop_count % 15 == 0:
@@ -227,6 +261,7 @@ def worker_loop(vram_gb):
                 job_id   = res.json()["job_id"]
                 messages = res.json()["payload"]["messages"]
                 log.info(f"接到任務 {job_id}，開始推論...")
+                last_activity_at = time.time()  # 領到任務＝有活動，重置閒置計時
                 try:
                     result = run_inference(messages)
                     submit_result(job_id, result=result)
@@ -234,6 +269,11 @@ def worker_loop(vram_gb):
                 except Exception as e:
                     log.error(f"推論失敗：{e}")
                     submit_result(job_id, error=str(e))
+                last_activity_at = time.time()  # 任務處理完成，再次更新，閒置計時從「完成時」重算
+
+            elif CONFIG["IDLE_STOP_SEC"] > 0 and (time.time() - last_activity_at) > CONFIG["IDLE_STOP_SEC"]:
+                idle_min = round((time.time() - last_activity_at) / 60, 1)
+                shutdown(f"已閒置 {idle_min} 分鐘（超過 {CONFIG['IDLE_STOP_SEC']} 秒門檻），自動停止以節省 GPU 配額")
 
             loop_count += 1
             time.sleep(2)
