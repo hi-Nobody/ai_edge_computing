@@ -1,4 +1,11 @@
-# FinFlow 分散式邊緣運算系統部署指南（v14，補上 Kaggle Notebook 實際部署踩過的雷）
+# FinFlow 分散式邊緣運算系統部署指南（v15，補上 server.py 路由順序 bug、閒置自動停止機制）
+
+> 本輪（v15）是實際把 Kaggle 節點接上 Oracle 之後，從「節點心跳正常、但送出的任務永遠
+> 卡在 `pending`／`Timeout waiting for edge nodes`」這個現象一路排查出來的，核心是
+> `server.py` 裡一個路由宣告順序的 bug，**不是網路、金鑰、或是 timeout 數值設太短的問題**
+> （雖然這次也順手把這幾項都優化了）。詳見「Step 3.5：已知過的重大 bug」與下方 v15 變更紀錄。
+> 另外新增邊緣節點「閒置自動停止」機制，避免忘記手動關閉 Kaggle/Colab session 而浪費 GPU 配額，
+> 詳見 Step 5。
 
 > 本文件取代前一版 DEPLOY.md。本輪（v13）評估過「把 `caddy.service` 併入
 > `finflow-queue.service`，減少要維護的環境變數設定檔案數量」這個提案，**決定不合併**：
@@ -145,6 +152,38 @@ sudo restorecon -v /home/opc/finflow-queue/finflow-queue.env
 ```
 
 **不需要額外設定 cron 排程**——容錯巡檢（逾時重排、DLQ、資源枯竭通知）已在 server.py 啟動時自動以背景執行緒每 15 秒跑一次，`/system/cron` 端點只是保留給你手動觸發測試用（已加上 `CLIENT_API_KEY` 驗證）。
+
+## Step 3.5：已知過的重大 bug —— `/jobs/next` 被 `/jobs/{job_id}` 攔截
+
+**症狀**：`GET /nodes` 顯示節點 `alive:true`、心跳正常送達，但透過 `/v1/chat/completions`
+或 `POST /jobs` 建立的任務永遠卡在 `pending`，`/v1/chat/completions` 最終回
+`{"detail":"Timeout waiting for edge nodes"}`；如果直接手動模擬節點去打
+`GET /jobs/next?node_id=<你的節點>`，會發現回傳 `401 {"detail":"Invalid Client API Key"}`——
+即使帶的是完全正確的 `NODE_API_KEY`。
+
+**原因**：FastAPI 依「宣告順序」由上往下比對路由。`server.py` 裡如果
+`GET /jobs/{job_id}`（萬用路徑參數，要求 `CLIENT_API_KEY`）宣告在
+`GET /jobs/next`（節點輪詢專用，要求 `NODE_API_KEY`）**之前**，`/jobs/next` 這個請求
+會被前者攔截、把字串 `"next"` 誤判成 `job_id`，並套用錯誤的驗證邏輯——節點端不管帶什麼
+key 都會被拒絕，**心跳能過但永遠領不到任務**，是這個 bug 最容易讓人誤判方向的地方（因為
+心跳是走另一支獨立的 `/nodes/heartbeat`，不受影響，看起來節點像是「活著但沒工作可做」，
+容易誤以為是任務指派邏輯或 capability 比對的問題）。
+
+**確認你手上的 `server.py` 是否已修正**：
+
+```bash
+grep -n "^@app.get(\"/jobs" server.py
+```
+
+正確順序應該是 `/jobs/next` 在前、`/jobs/{job_id}` 在後：
+
+```
+@app.get("/jobs/next")
+@app.get("/jobs/{job_id}", dependencies=[Depends(verify_client_key)])
+```
+
+如果你的版本反過來，代表用的是 v14（含）以前的 `server.py`，請更新到本輪修正後的版本，
+覆蓋後 `sudo systemctl restart finflow-queue` 即可生效，不需要動任何其他設定或金鑰。
 
 ## Step 4：啟用 HTTPS
 
@@ -331,6 +370,12 @@ Discord 的部分，先看到訊息顯示「思考中…」（deferred 回應）
 `edge-worker/` 這層結構、還是只把這兩個檔案單獨複製到 Kaggle/Colab 的工作目錄，
 都一樣找得到：
 
+節點啟動流程現在會在「向 Oracle 報到」之後、「進入主輪詢迴圈」之前，多一段**模型暖機**
+（送一次假的推論請求，讓 Ollama 把模型先載進 VRAM）。這是刻意的行為：避免第一個真正
+任務因為模型冷啟動疊加推論時間，超過 Oracle 端的 long-poll timeout。代價是節點啟動到
+真正能接任務之間會多花數十秒到一兩分鐘（視模型大小與硬體而定），屬正常現象，log 裡
+看到 `模型暖機中...` 停留一陣子不用擔心，等到 `模型暖機完成` 出現就代表沒問題了。
+
 ### Kaggle／Colab Notebook 已知雷（跟本專案程式碼無關，但一定會踩到）
 
 這幾個是實際在 Kaggle Notebook 上部署時踩到的環境限制，不是 `bootstrap.py` 的 bug，
@@ -406,12 +451,44 @@ print("bootstrap.py 已在背景啟動，PID:", proc.pid)
 這個端點，兩者是不同層級的金鑰，帶錯會被拒絕。回應裡看到
 `"node_id":"kaggle-1","alive":true` 才代表這個節點真的註冊成功、心跳有送達。
 
+**5. 用 `subprocess.Popen` 背景啟動的那個 cell，千萬不要重複執行**
+
+每執行一次第 3 點的那段 `subprocess.Popen` 程式碼，就會多開一個 `bootstrap.py` process；
+如果不小心重複點了那個 cell 好幾次（很常見，尤其是在除錯、重跑 cell 的時候），會變成
+好幾個 process 用同一個 `NODE_ID` 同時搶著送心跳、搶著領任務，互相干擾，行為會變得很難
+預測（心跳一下被這個蓋過、一下被那個蓋過）。定期檢查有沒有意外疊了多個：
+
+```bash
+!ps aux | grep -E "bootstrap.py|ollama serve"
+```
+
+如果同一支程式出現超過一個 PID，先全部關掉、確認清空後只重啟一個：
+
+```bash
+!kill -TERM <PID1> <PID2> ...     # 優雅關閉，會走程式內建的清理流程
+# 等幾秒後再次確認，若還有殘留（少見）再用：
+!pkill -9 -f bootstrap.py
+!pkill -9 -f "ollama serve"
+```
+
+**6. 閒置自動停止（`IDLE_STOP_SEC`）與如何手動停止節點**
+
+`bootstrap.py` 內建閒置偵測：連續 `IDLE_STOP_SEC` 秒（`edge.conf`／環境變數可調，預設
+1800 秒＝30 分鐘）沒有任何任務可做，就會自動結束 process（同時關閉自己啟動的
+`ollama serve`），避免忘記手動關閉而持續佔用 Kaggle/Colab 的 GPU 配額。設為 `0`
+或負數則停用此機制，維持永久運行。
+
+需要提早手動停止時（不管是不是背景執行），優先用 `SIGTERM`（`kill -TERM`，如上），
+會走同一套優雅關閉流程，妥善收掉 Ollama 子行程，不會留下孤兒 process；只有在
+`SIGTERM` 沒反應時才用 `kill -9`／`pkill -9` 強制清除。
+
 ```bash
 # 方式 A：把 edge.conf 內容改好後直接跑（長期在同一台機器上管理最方便）
 # 從 repo 的 edge-worker/ 資料夾把 bootstrap.py、edge.conf 一起複製到工作目錄
 # （兩個檔案要放在同一層，不用管理它是不是還在 edge-worker/ 底下），
 # 編輯 edge.conf 填入：
-#   ORACLE_URL、NODE_ID、NODE_API_KEY（必須跟 Step 2 登記的一致）、MODEL_NAME
+#   ORACLE_URL、NODE_ID、NODE_API_KEY（必須跟 Step 2 登記的一致）、MODEL_NAME、
+#   IDLE_STOP_SEC（選填，預設 1800，設 0 或負數停用自動停止）
 pip install -r edge-worker/requirements.txt -q
 python edge-worker/bootstrap.py
 ```
@@ -423,6 +500,7 @@ os.environ["ORACLE_URL"] = "https://<你的Oracle公開IP或網域>"
 os.environ["NODE_ID"] = "kaggle-1"          # 必須跟 Step 2 登記的一致
 os.environ["NODE_API_KEY"] = "<金鑰A>"        # 必須跟 Step 2 登記的一致
 os.environ["MODEL_NAME"] = "qwen2.5-coder:14b"
+os.environ["IDLE_STOP_SEC"] = "1800"        # 選填，預設就是 1800；設 "0" 可停用自動停止
 
 !pip install requests -q
 # 在 Kaggle 上直接 !python bootstrap.py 前景執行的話，這個 cell 會因為
@@ -474,6 +552,27 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v15（本次）
+
+這輪起因是把 Kaggle 節點實際接上 Oracle 之後，`GET /nodes` 顯示節點心跳正常，但送出的
+任務永遠卡在 `pending`、最終 timeout。一路排查後發現是 `server.py` 一個路由宣告順序的
+bug，跟金鑰、網路、timeout 數值都無關（雖然後兩者這輪也一併優化了）：
+
+| 內容 | 說明 |
+|------|------|
+| `server.py` 路由順序 bug | `GET /jobs/{job_id}`（萬用路徑）宣告在 `GET /jobs/next`（節點輪詢專用）之前，導致 `/jobs/next` 被前者攔截、誤判 `job_id="next"`，套用錯誤的 `verify_client_key` 驗證，節點端不管帶什麼 `NODE_API_KEY` 都會 401。心跳走的是另一支獨立端點，不受影響，所以現象是「節點活著、但永遠領不到任務」，很容易被誤判成別的問題方向 |
+| 逾時設定與冷啟動 | 找 bug 過程中一併確認：`LONG_POLL_TIMEOUT_SEC`（Oracle 端同步等待上限）需要 ≥ 節點端 Ollama 推論的 `timeout`，否則模型冷啟動（首次載入 VRAM）疊加推論時間很容易超過而誤判逾時 |
+| 節點端新增「模型暖機」 | `bootstrap.py` 在向 Oracle 報到後、進入主輪詢迴圈前，先送一次假推論請求把模型載進 VRAM，避免第一個真正任務才在冷啟動 |
+| 節點端新增「閒置自動停止」 | 新增 `IDLE_STOP_SEC` 設定（預設 1800 秒），連續閒置超過此門檻自動結束 process（含關閉 Ollama 子行程），避免忘記手動關閉而持續佔用 Kaggle/Colab GPU 配額；同時掛上 `SIGINT`/`SIGTERM` handler，手動停止也走同一套優雅關閉流程 |
+| Kaggle 背景執行踩過的新雷 | 同一個 `subprocess.Popen` 啟動 cell 若重複執行會疊加多個 process，用同一個 `NODE_ID` 互搶心跳/任務，行為變得難預測；需要定期用 `ps aux` 檢查、`kill -TERM` 清理 |
+
+| 檔案 | 變更 |
+|------|------|
+| `server.py` | `GET /jobs/next` 移到 `GET /jobs/{job_id}` 之前宣告，修正路由被萬用路徑攔截的 bug；`LONG_POLL_TIMEOUT_SEC` 建議調整為與節點端推論 timeout 相當或更長 |
+| `edge-worker/bootstrap.py` | 新增啟動時模型暖機邏輯；新增 `IDLE_STOP_SEC` 閒置自動停止機制與對應的 `shutdown()` 清理函式；新增 `SIGINT`/`SIGTERM` handler |
+| `edge-worker/edge.conf` | 新增 `IDLE_STOP_SEC` 設定項與說明註解 |
+| `DEPLOY.md`（本檔） | 升級至 v15；新增「Step 3.5：已知過的重大 bug」說明路由順序問題與自我檢查方式；Step 5 新增模型暖機說明、閒置自動停止與手動停止（含背景多重 process 排查）的操作指引 |
 
 ### v14（本次）
 
