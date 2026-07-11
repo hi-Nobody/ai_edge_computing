@@ -1,4 +1,4 @@
-# FinFlow 分散式邊緣運算系統部署指南（v11，修正 g4f_worker.py 路徑文件與實際不符）
+# FinFlow 分散式邊緣運算系統部署指南（v12，bot-gateway 部署路徑確定為 finflow-queue/bot-gateway/）
 
 > 本文件取代前一版 DEPLOY.md。主要差異：改用 venv 部署（迴避 Ubuntu 新版 pip 限制）、
 > 檔名由 main.py 改為 server.py、**不需要額外設定 cron**（維護邏輯已改回自動背景執行緒）、
@@ -11,10 +11,12 @@
 > `edge-worker/` 資料夾**（`g4f_worker.py` 維持在根目錄，跟 `server.py` 共用同一個 venv，
 > 見「Step 5.5」的說明），`server.py` 恢復 `GET /nodes` 監控端點、
 > **`bot_gateway.py`／`bot-gateway.service`／`register_discord_commands.py`／
-> bot 專用 `requirements.txt` 四個檔案整理進 `bot-gateway/` 資料夾**（見「Step 4.5」，VM 上的
-> 部署路徑同步從 `/home/opc/ui-bot` 改為 `/home/opc/bot-gateway`）、`bot-gateway.service`
-> 改用 `EnvironmentFile` 讀取 `finflow-queue.env`，不再把金鑰明碼寫在 unit file 裡（跟
-> `finflow-queue.service` 同一套修法，兩個服務現在共用同一份機敏設定檔）。
+> bot 專用 `requirements.txt` 四個檔案整理進 `bot-gateway/` 資料夾**（見「Step 4.5」）、
+> `bot-gateway.service` 改用 `EnvironmentFile` 讀取 `finflow-queue.env`，不再把金鑰明碼寫在
+> unit file 裡（跟 `finflow-queue.service` 同一套修法，兩個服務現在共用同一份機敏設定檔）、
+> **VM 上的實際部署路徑最終定為 `/home/opc/finflow-queue/bot-gateway`**（巢狀在
+> `finflow-queue` 底下，取代先前試過的 `/home/opc/ui-bot`、`/home/opc/bot-gateway`
+> 兩種平行擺放的路徑，見版本紀錄 v12 的說明）。
 >
 > 另外根據實際部署經驗補充：本文件範例路徑統一使用 `/home/opc`（OCI 預設使用者）。
 > 若你在 **Oracle Linux** 上部署，實測會遇到 **SELinux**
@@ -34,11 +36,17 @@
 > 但 `bot-gateway/venv/`（Python 執行檔本身）需要**另外**relabel，跟 `EnvironmentFile`
 > 是不同的坑（一個是「讀設定檔」被擋，一個是「執行程式」被擋）：
 > ```bash
-> sudo semanage fcontext -a -t bin_t '/home/opc/bot-gateway/venv/bin(/.*)?'
-> sudo restorecon -Rv /home/opc/bot-gateway/venv/bin
-> sudo semanage fcontext -a -t lib_t '/home/opc/bot-gateway/venv/lib(/.*)?\.so(\.[0-9]+)*'
-> sudo restorecon -Rv /home/opc/bot-gateway/venv/lib
+> sudo semanage fcontext -a -t bin_t '/home/opc/finflow-queue/bot-gateway/venv/bin(/.*)?'
+> sudo restorecon -Rv /home/opc/finflow-queue/bot-gateway/venv/bin
+> sudo semanage fcontext -a -t lib_t '/home/opc/finflow-queue/bot-gateway/venv/lib(/.*)?\.so(\.[0-9]+)*'
+> sudo restorecon -Rv /home/opc/finflow-queue/bot-gateway/venv/lib
 > ```
+> 這組 relabel 規則是綁在「路徑」上的，不是綁在「服務」上——如果之後又把
+> `bot-gateway/` 資料夾搬到別的地方（哪怕只是搬回本來的 `/home/opc/bot-gateway`），
+> 新路徑要重新下一次 `semanage fcontext`／`restorecon`，不會自動沿用；同時 venv
+> 內的 `venv/bin/uvicorn` 等進入點腳本的 shebang 也會寫死目前這個絕對路徑，資料夾
+> 一旦搬家就得整個 `rm -rf venv` 重建，不能只搬資料夾了事（這是實際部署時繞了
+> 兩三輪路徑才踩出來的兩個坑，見版本紀錄 v12）。
 
 ---
 
@@ -147,7 +155,7 @@ sudo ./setup-https.sh
 內部的 `127.0.0.1:8000`。
 
 ```bash
-mkdir -p /home/opc/bot-gateway && cd /home/opc/bot-gateway
+mkdir -p /home/opc/finflow-queue/bot-gateway && cd /home/opc/finflow-queue/bot-gateway
 # 把 repo 裡 bot-gateway/ 資料夾底下的四個檔案（bot_gateway.py、bot-gateway.service、
 # register_discord_commands.py、requirements.txt）整包上傳至此資料夾。
 # bot-gateway.service 稍後會複製到 /etc/systemd/system/，不需要留在這裡執行；
@@ -236,13 +244,13 @@ Requires=finflow-queue.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/opc/bot-gateway
+WorkingDirectory=/home/opc/finflow-queue/bot-gateway
 EnvironmentFile=/home/opc/finflow-queue/finflow-queue.env
 Environment=ORACLE_INTERNAL_URL=http://127.0.0.1:8000
-Environment=GATEWAY_DB_PATH=/home/opc/bot-gateway/bot_gateway.db
+Environment=GATEWAY_DB_PATH=/home/opc/finflow-queue/bot-gateway/bot_gateway.db
 Environment=JOB_WAIT_TIMEOUT_SEC=900
 Environment=HISTORY_MAX_MESSAGES=20
-ExecStart=/home/opc/bot-gateway/venv/bin/uvicorn bot_gateway:app --host 127.0.0.1 --port 8001
+ExecStart=/home/opc/finflow-queue/bot-gateway/venv/bin/uvicorn bot_gateway:app --host 127.0.0.1 --port 8001
 Restart=always
 RestartSec=5
 User=opc
@@ -366,6 +374,29 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v12（本次）
+
+`bot-gateway` 的實際部署路徑這輪定案了：**巢狀在 `/home/opc/finflow-queue/bot-gateway`**，
+取代 v11 當時採用的 `/home/opc/bot-gateway`（跟 `finflow-queue` 平行擺放）。這個決定是
+在反覆搬動資料夾、實際排查兩個部署地雷之後定下來的，順便把過程中發現的兩個「非本專案
+程式碼問題、但很容易忽略」的坑記錄下來：
+
+- **venv 不能直接搬家**：`venv/bin/uvicorn` 這類進入點腳本的 shebang 會在建立當下寫死
+  絕對路徑指向自己的 Python 直譯器；資料夾搬動後 shebang 沒有跟著變，會導致
+  `systemctl start` 出現 `203/EXEC`。這跟 SELinux 無關，是 venv 本身的限制，唯一解法是
+  搬完資料夾後 `rm -rf venv` 重建，不能只搬資料夾了事。
+- **SELinux relabel 是綁在路徑上的**：`bin_t`/`lib_t` 的 `semanage fcontext` 規則認的是
+  絕對路徑字串，資料夾換位置後要對新路徑重新下一次，不會自動沿用舊路徑的規則。
+
+| 檔案 | 變更 |
+|------|------|
+| `bot-gateway/bot-gateway.service` | `WorkingDirectory`／`GATEWAY_DB_PATH`／`ExecStart` 三處路徑從 `/home/opc/bot-gateway` 改為 `/home/opc/finflow-queue/bot-gateway` |
+| `DEPLOY.md`（本檔） | Step 4.5 的 `mkdir`／`cd` 指令、內嵌的 `bot-gateway.service` 範例、檔頭 intro 的 SELinux relabel 範例指令，三處路徑同步更新；新增本次 changelog，並附上 venv 搬家、SELinux relabel 這兩個實際踩過的地雷說明，方便日後再調整路徑時提醒自己 |
+
+（下面 v11 的紀錄裡「搬到 `/home/opc/bot-gateway` 是對的」這段描述，是**當時那個決定**的
+正確性判斷，不代表現在的最終路徑——現在的最終路徑以本次 v12 為準。歷史紀錄予以保留，
+不回頭修改，避免搞混「這是哪個時間點的狀態」。）
 
 ### v11（本次）
 
