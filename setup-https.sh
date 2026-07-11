@@ -48,12 +48,15 @@ sudo cp Caddyfile /etc/caddy/Caddyfile
 
 echo "=== 步驟 4：讓 Caddy 服務讀得到 ORACLE_PUBLIC_IP ==="
 # Caddyfile 裡用 {$ORACLE_PUBLIC_IP} 引用這個環境變數，但 caddy 套件安裝的
-# caddy.service 預設不會載入 finflow-queue.env，這裡用 drop-in override 補上
+# caddy.service 預設不會載入 finflow-queue.env，這裡用 drop-in override 補上。
+# override 的內容維護在獨立檔案 caddy-override.conf 裡（可被 git 追蹤、單獨
+# review diff），不再內嵌於本腳本的 heredoc 中。
+if [ ! -f caddy-override.conf ]; then
+    echo "ERROR：找不到 caddy-override.conf，請確認它在同一目錄下"
+    exit 1
+fi
 sudo mkdir -p /etc/systemd/system/caddy.service.d
-sudo tee /etc/systemd/system/caddy.service.d/override.conf > /dev/null << EOF
-[Service]
-EnvironmentFile=$ENV_FILE
-EOF
+sudo cp caddy-override.conf /etc/systemd/system/caddy.service.d/override.conf
 sudo systemctl daemon-reload
 
 echo "=== 步驟 5：啟動並設定 Caddy 開機自啟 ==="

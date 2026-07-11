@@ -1,6 +1,24 @@
-# FinFlow 分散式邊緣運算系統部署指南（v12，bot-gateway 部署路徑確定為 finflow-queue/bot-gateway/）
+# FinFlow 分散式邊緣運算系統部署指南（v13，caddy-override.conf 抽成獨立檔案後）
 
-> 本文件取代前一版 DEPLOY.md。主要差異：改用 venv 部署（迴避 Ubuntu 新版 pip 限制）、
+> 本文件取代前一版 DEPLOY.md。本輪（v13）評估過「把 `caddy.service` 併入
+> `finflow-queue.service`，減少要維護的環境變數設定檔案數量」這個提案，**決定不合併**：
+> 全系統目前只有一份機敏設定檔（`finflow-queue.env`），`finflow-queue.service`／
+> `bot-gateway.service` 兩個自己寫的 unit file 直接用 `EnvironmentFile=` 讀取，
+> `caddy.service` 因為是 `dnf`/`copr` 套件安裝、不歸這個 repo 管（套件更新會覆蓋
+> unit file 本體），只能透過 systemd 官方的 drop-in override 機制外掛一條
+> `EnvironmentFile=` 進去——這已經是「只有一份 env 檔」的狀態，真正把三個服務
+> 合併成一個 systemd unit 反而會製造新問題：Caddy 需要綁 443 特權 port、跑在
+> 專用的 `caddy` 系統帳號下，跟 `finflow-queue.service` 用的 `opc` 帳號、8000
+> 這種一般 port 的權限模型不同；systemd 一個 `Type=simple` 服務只能有一個主行程，
+> 硬塞兩個長駐行程進同一個 unit 會讓 `systemctl restart`／`journalctl` 沒辦法
+> 針對單一服務獨立操作與查log。維持三個服務分開、共用同一份 env 檔，是目前
+> 最合理的做法。
+>
+> 本輪順手把原本埋在 `setup-https.sh` heredoc 裡的 caddy drop-in override 內容，
+> 抽成獨立檔案 `caddy-override.conf`（見「Step 4」），可被 git 追蹤、單獨 review
+> diff，`setup-https.sh` 改成直接 `cp` 這個檔案。
+>
+> 前一版（v12）差異：改用 venv 部署（迴避 Ubuntu 新版 pip 限制）、
 > 檔名由 main.py 改為 server.py、**不需要額外設定 cron**（維護邏輯已改回自動背景執行緒）、
 > **新增 Discord Slash Command 支援**（`bot_gateway.py` 補上 `/discord/interactions`
 > 端點，可與 Telegram/LINE 並存或互相切換）、**`bootstrap.py` 改用 `edge.conf` 集中管理設定**
@@ -142,9 +160,13 @@ sudo ./setup-https.sh
 
 腳本內部流程：讀取 `ORACLE_PUBLIC_IP` → 安裝 Caddy → 複製 `Caddyfile` 到
 `/etc/caddy/Caddyfile`（檔案內容是 `{$ORACLE_PUBLIC_IP}` 佔位符，不是真實 IP）→
-幫 `caddy.service` 建立一個 systemd drop-in（`EnvironmentFile=finflow-queue.env`），
-讓 Caddy 進程啟動時能讀到這個環境變數並代入 `{$ORACLE_PUBLIC_IP}` → 啟動 Caddy →
-開防火牆。
+把 `caddy-override.conf`（repo 裡的獨立檔案，內容是一條 `EnvironmentFile=`）複製到
+`caddy.service` 的 systemd drop-in 目錄，讓 Caddy 進程啟動時能讀到 `ORACLE_PUBLIC_IP`
+並代入 `{$ORACLE_PUBLIC_IP}` → 啟動 Caddy → 開防火牆。
+
+（為什麼不乾脆把 `caddy.service` 併入 `finflow-queue.service` 少維護一個服務？
+見本文件最上方版本說明的評估——已經是「全系統只有一份 env 檔」的狀態，合併服務
+本身沒有必要，還會製造權限模型衝突跟 log 混雜的新問題。）
 
 別忘了到 OCI 控制台的 Security List 開放 443 port，這一步腳本做不到。
 
@@ -374,6 +396,15 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v13（本次）
+
+| 檔案 | 變更 |
+|------|------|
+| 評估：`caddy.service` 併入 `finflow-queue.service` | 決定不合併，理由詳見本文件最上方版本說明（權限模型衝突、systemd 單一主行程限制、套件更新會覆蓋合併後的 unit file）。目前架構已經是「全系統一份 `finflow-queue.env`，三個服務共用」，符合「減少設定散落」的原始訴求，不需要靠合併服務達成 |
+| `caddy-override.conf`（新增檔案） | 把原本埋在 `setup-https.sh` heredoc 裡的 caddy systemd drop-in override 內容抽成獨立檔案，可被 git 追蹤、單獨 review diff |
+| `setup-https.sh` | 步驟 4 改成檢查並 `cp caddy-override.conf`，不再用 heredoc 內嵌內容 |
+| `DEPLOY.md`（本檔） | 版本號改為 v13；新增上述評估說明；Step 4 的流程描述同步更新 |
 
 ### v12（本次）
 
