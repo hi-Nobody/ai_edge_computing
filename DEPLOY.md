@@ -1,4 +1,15 @@
-# FinFlow 分散式邊緣運算系統部署指南（v18，Step 4 改寫為完整教學，新增 Cloudflare 方案 D）
+# FinFlow 分散式邊緣運算系統部署指南（v19，Discord Bot 建立步驟改為六步驟＋discord-admin.env）
+
+> 本輪（v19）把「建立 Discord Bot」小節重寫成更詳細的六步驟流程（實際跑過一次部署
+> 才整理出來的順序），並把 `DISCORD_BOT_TOKEN`／`DISCORD_APPLICATION_ID` 這兩把
+> 一次性腳本才需要的機密資訊，從「臨時 `export`、用完即丟」改成寫進一個獨立的
+> `discord-admin.env`（不進版本控制，只有 `register_discord_commands.py` 執行時
+> `source` 讀取），比每次手動貼 token 方便，又不會混進 `bot-gateway.service` 常駐
+> 讀取的 `finflow-queue.env`。新增「Step 4 驗證失敗排錯」對照表，並把 TLS 需求的
+> 三個選項（方案 B／方案 C／上一版新增的 Step 4-D Cloudflare 代管憑證）一併列出。
+
+> 前一版（v18）差異：把原本過於簡略的「Step 4：啟用 HTTPS」整段改寫成手把手教學，
+> 新增「Step 4-D：改用 Cloudflare 代管憑證」與「Step 4 疑難排解」對照表。
 
 > 本輪（v18）把原本過於簡略的「Step 4：啟用 HTTPS」整段改寫成手把手教學：從 OCI
 > Cloud Shell 怎麼連進 Oracle VM 開始，`setup-https.sh` 內部每一步在做什麼都拆成表格
@@ -394,7 +405,7 @@ curl -k https://158.101.16.137/healthz          # 換成你自己的 IP，測試
 Discord / 使用者  ──HTTPS（Cloudflare 的受信任憑證）──▶  Cloudflare  ──HTTPS（可以是自簽）──▶  Oracle
 ```
 外部看到的永遠是 Cloudflare 出示的憑證，Oracle 端可以繼續用現有的 `tls internal` 自簽憑證，
-不需要额外去申請或安裝任何新憑證。
+不需要額外去申請或安裝任何新憑證。
 
 **① Cloudflare 加一筆 DNS 記錄，指向 Oracle 公開 IP**
 
@@ -510,34 +521,131 @@ pip install -r requirements.txt   # 已含 pynacl，Discord 簽章驗證需要
 Discord 跟 Telegram/LINE 的架構不一樣：Discord 沒有「使用者傳訊息就觸發 webhook」
 這種機制（那是 Gateway WebSocket 常駐連線的範疇），本專案改用 Discord 的
 **Slash Command + Interactions Endpoint**（使用者輸入 `/ask prompt:<內容>`
-觸發，HTTP 一次性請求，跟 Telegram/LINE 一樣是無狀態服務就能處理）。
+觸發，HTTP 一次性請求，跟 Telegram/LINE 一樣是無狀態服務就能處理）。這一節需要
+**受信任的 TLS 憑證**（Discord 驗證端點只接受受信任 CA 簽發的憑證，方案 A 的
+`tls internal` 自簽憑證會被直接拒絕）：用方案 B（正式網域 + Let's Encrypt）、
+方案 C（Cloudflare Tunnel）、或 Step 4-D（Cloudflare 代管憑證，橘色雲朵代理）
+三選一都可以，完整分六步：
 
-1. 到 [Discord Developer Portal](https://discord.com/developers/applications)
-   建立一個 New Application，記下：
-   - **Application ID**（General Information 頁籤）→ 給 `DISCORD_APPLICATION_ID`
-     （只有註冊指令的腳本需要，服務本身不需要）
-   - **Public Key**（同一頁）→ 給 `DISCORD_PUBLIC_KEY`（服務驗證簽章要用）
-   - 到 Bot 頁籤按 Reset Token 拿到 **Bot Token** → 給 `DISCORD_BOT_TOKEN`
-     （同樣只有註冊指令的腳本需要）
-2. 註冊 Slash Command（**不是嚴格意義上的一次性腳本**：往後想調整指令內容，例如幫
-   `/ask` 加新參數，直接改 `register_discord_commands.py` 裡的 `COMMAND_PAYLOAD` 再重新
-   執行即可，Discord 會用同名指令覆蓋舊定義，不會重複建立）：
-   ```bash
-   export DISCORD_BOT_TOKEN="<Bot Token>"
-   export DISCORD_APPLICATION_ID="<Application ID>"
-   # 若想先在自己的測試伺服器立即生效，設定這個（否則 Global Command 最多要等 1 小時）：
-   # export DISCORD_GUILD_ID="<你的測試伺服器 ID>"
-   python3 register_discord_commands.py              # 註冊／更新
-   python3 register_discord_commands.py --list         # 查看目前已註冊的指令
-   python3 register_discord_commands.py --delete ask   # 刪除指定名稱的指令
-   ```
-3. 到 General Information 頁籤，把 **Interactions Endpoint URL** 填成
-   `https://<你的網域>/discord/interactions`，儲存時 Discord 會立刻打一次
-   PING 過去驗證簽章與連線是否正常（`bot_gateway.py` 要先跑起來才能通過這一步）。
-   **這一步只接受受信任 CA 簽發的 TLS 憑證，方案 A 的自簽憑證會驗證失敗**，
-   請改用方案 B（正式網域 + Let's Encrypt）或方案 C（Cloudflare Tunnel）。
-4. 到 OAuth2 → URL Generator，勾選 `applications.commands`（如果要在伺服器
-   中使用還要勾 `bot` 並給基本權限），產生邀請連結，把 Bot 加進你的伺服器。
+**Step 1：建立 Discord Application**
+
+前往 [Discord Developer Portal](https://discord.com/developers/applications) →
+**New Application**，取個名字建立。建立完記下三樣東西：
+
+- **Application ID**（General Information 頁籤）→ 給 `DISCORD_APPLICATION_ID`
+- **Public Key**（同一頁）→ 給 `DISCORD_PUBLIC_KEY`（常駐服務驗證簽章要用，
+  這把**要**放進 `finflow-queue.env`，見 Step 2）
+- 點左側 **Bot** 頁籤 → **Reset Token** → 拿到 **Bot Token** → 給 `DISCORD_BOT_TOKEN`
+  （只有一次性的註冊指令腳本需要，**不要**放進 `finflow-queue.env`，見 Step 3 的說明）
+
+**Step 2：把 `DISCORD_PUBLIC_KEY` 填進伺服器設定**
+
+```bash
+nano /home/opc/finflow-queue/finflow-queue.env
+```
+
+找到 `DISCORD_PUBLIC_KEY=` 這行，填入 Step 1 拿到的 Public Key，存檔後重啟：
+
+```bash
+sudo systemctl restart bot-gateway
+sudo systemctl status bot-gateway --no-pager -l
+```
+
+確認是 `active (running)` 再往下走。
+
+**Step 3：註冊 Slash Command（`/ask`）**
+
+`DISCORD_BOT_TOKEN`／`DISCORD_APPLICATION_ID` 這兩把**不進** `finflow-queue.env`——
+`finflow-queue.env` 是常駐服務（`bot-gateway.service`）執行期間會一直讀取的設定檔，
+但這兩把只有 `register_discord_commands.py` 這支**一次性腳本**用得到，`bot_gateway.py`
+本身處理 Discord 互動時完全不需要 Bot Token（驗證用 `DISCORD_PUBLIC_KEY` 的 Ed25519
+簽章，回覆用 Discord 隨請求夾帶的 interaction token，兩者都跟 Bot Token 無關）。且 Bot
+Token 的權限比 Public Key 大得多（可以讓 bot 發訊息、讀頻道），常態放進常駐服務讀取的
+設定檔，等於讓服務整個執行期間都握著一把用不到、風險卻更高的權限。
+
+改用一個**獨立、不進版本控制**的檔案存放，跟 `register_discord_commands.py`
+放同一層：
+
+```bash
+cd /home/opc/finflow-queue/bot-gateway
+nano discord-admin.env
+```
+
+內容：
+
+```bash
+DISCORD_BOT_TOKEN=<Step 1 的 Bot Token>
+DISCORD_APPLICATION_ID=<Step 1 的 Application ID>
+# 若想先在自己的測試伺服器立即生效，取消下一行的註解（否則 Global Command 最多要等 1 小時）：
+# DISCORD_GUILD_ID=<你的測試伺服器 ID>
+```
+
+**這個檔案千萬不要 `git add`**——確認 repo 的 `.gitignore` 裡有排除
+`bot-gateway/discord-admin.env`（或整條規則 `discord-admin.env`），這份權限比
+`DISCORD_PUBLIC_KEY` 大很多，一旦被 commit 進 git 歷史，就算之後刪掉、重新
+commit，舊的 commit 紀錄裡還是查得到明碼，唯一補救方法是重寫 git 歷史或整個
+repo 重建，非常麻煩——不要讓它有機會被追蹤到才是根本解法。
+
+準備好之後 `source` 這個檔案、跑註冊腳本：
+
+```bash
+source venv/bin/activate
+source discord-admin.env
+python3 register_discord_commands.py              # 註冊／更新
+python3 register_discord_commands.py --list         # 查看目前已註冊的指令
+python3 register_discord_commands.py --delete ask   # 刪除指定名稱的指令
+```
+
+看到「註冊/更新成功」就是這步完成了。這不是嚴格意義上的一次性腳本：往後想調整
+指令內容（例如幫 `/ask` 加新參數），直接改 `register_discord_commands.py` 裡的
+`COMMAND_PAYLOAD` 再重新 `source discord-admin.env` 跑一次即可，Discord 會用同名
+指令覆蓋舊定義，不會重複建立。
+
+**Step 4：設定 Interactions Endpoint URL**
+
+回到 Discord Developer Portal → **General Information** 頁籤，把 **Interactions
+Endpoint URL** 填成：
+
+```
+https://<你的網域>/discord/interactions
+```
+
+（用方案 B／C 就是自己的正式網域；用 Step 4-D 的 Cloudflare 代管憑證，就是
+Cloudflare 那筆 DNS 記錄設定的網域，例如 `myproj2.dpdns.org`）
+
+**按下儲存的瞬間，Discord 會立刻打一次 PING 過去驗證**——這一步能不能過，取決於
+Step 2 的 `bot-gateway` 有沒有正常跑起來、`DISCORD_PUBLIC_KEY` 有沒有填對、以及
+這個網域現在給出的憑證是不是真的受信任（`curl https://<網域>/healthz` 不用加 `-k`
+也能正常回應，才代表憑證這關沒問題）。存檔後若顯示紅字驗證失敗，見下方
+「Step 4 驗證失敗排錯」。
+
+**Step 5：把 Bot 邀請進你的伺服器**
+
+左側 **OAuth2 → URL Generator**：
+
+- Scopes 勾選 `applications.commands`（如果也想讓 bot 出現在成員列表、之後可能用到
+  其他訊息功能，順便勾 `bot`）
+- 下面若出現 Bot Permissions，勾 `Send Messages` 即可
+- 複製底部產生的網址，用瀏覽器打開，選擇你的伺服器，完成授權
+
+**Step 6：實測**
+
+到剛加入 Bot 的伺服器，任一頻道輸入：
+
+```
+/ask prompt: 你好
+```
+
+應該會先看到「思考中…」，幾秒到幾分鐘後（視邊緣節點忙碌程度）被編輯成真正的回覆。
+
+**Step 4 驗證失敗排錯**：跑 `sudo journalctl -u bot-gateway -f`，同時重新在 Discord
+那邊按一次儲存，看 log 即時輸出：
+
+| log 現象 | 排查方向 |
+|---|---|
+| 完全沒有任何請求進來 | 檢查 `Caddyfile` 的 `/discord/*` 路由、Cloudflare Proxy 狀態是不是也一起套用在這個網域上；如果是用 Step 4-D，確認橘色雲朵有開、加密模式是「完整」 |
+| 有請求進來但回 401 | 幾乎可以肯定是 `DISCORD_PUBLIC_KEY` 填錯或沒重啟服務，回 Step 2 再確認一次 |
+| 請求進來但整個逾時 | 檢查 `bot-gateway` 服務本身是不是真的 `active (running)` |
 
 ### 建立 LINE Bot（若要用 LINE）
 
@@ -893,6 +1001,26 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v19（本次）
+
+「建立 Discord Bot」小節重寫成六步驟，並改用 `discord-admin.env` 管理一次性腳本
+專用的機密資訊，取代原本「臨時 `export`」的寫法：
+
+| 檔案 | 變更 |
+|------|------|
+| `DEPLOY.md`（本檔） | 「建立 Discord Bot」小節重寫為 Step 1-6：① 建立 Application 拿三把金鑰 ② `DISCORD_PUBLIC_KEY` 填進 `finflow-queue.env` 並重啟 `bot-gateway` ③ 用新增的 `discord-admin.env`（放 `bot-gateway/` 資料夾、不進版控）存放 `DISCORD_BOT_TOKEN`／`DISCORD_APPLICATION_ID`，`source` 後執行 `register_discord_commands.py` ④ 設定 Interactions Endpoint URL（補上可用 Step 4-D 的 Cloudflare 網域這個選項）⑤ 邀請 Bot 進伺服器 ⑥ 實測 `/ask`；新增「Step 4 驗證失敗排錯」對照表（無請求進來／401／逾時三種現象對應的排查方向，並補上 Step 4-D 情境下要檢查橘色雲朵與加密模式） |
+
+**為什麼 `DISCORD_BOT_TOKEN`／`DISCORD_APPLICATION_ID` 不放進 `finflow-queue.env`**：
+`finflow-queue.env` 是常駐服務執行期間持續讀取的設定檔，但這兩把只有註冊指令的
+一次性腳本用得到，`bot_gateway.py` 處理 Discord 互動時完全不需要 Bot Token（驗證
+靠 `DISCORD_PUBLIC_KEY`，回覆靠請求裡夾帶的 interaction token）。Bot Token 權限比
+Public Key 大很多，讓常駐服務整個執行期間都握著用不到的權限沒有必要，改放進獨立、
+不進版控的 `discord-admin.env`，只在真的要跑註冊腳本那幾秒鐘 `source` 進來用。
+
+**為什麼 interaction token 不需要放進任何設定檔**：它是 Discord 每次觸發 `/ask`
+時動態產生、隨請求內容送過來的一次性權杖，15 分鐘後就失效，`bot_gateway.py` 直接
+從 request body 讀出來在記憶體裡用，本來就不該持久化保存。
 
 ### v18（本次）
 
