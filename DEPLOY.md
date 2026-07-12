@@ -396,7 +396,7 @@ curl -k https://158.101.16.137/healthz          # 換成你自己的 IP，測試
 
 ## Step 4-D：（選用）改用 Cloudflare 代管憑證，取代自簽憑證
 
-如果你已經有網域託管在 Cloudflare（例如 `myproj2.dpdns.org`），可以讓 Cloudflare 幫你
+如果你已經有網域託管在 Cloudflare（例如 `<你的網域>`），可以讓 Cloudflare 幫你
 處理對外憑證，這是唯一能滿足 **Discord Interactions Endpoint** 要求受信任憑證的簡便做法
 （`tls internal` 自簽憑證會被 Discord 直接拒絕，方案 A 過不了這關）。
 
@@ -432,7 +432,7 @@ nano Caddyfile
 ```
 找到站台位址那一行，在後面加上你的網域（逗號分隔，其他 `handle` 區塊都不用動）：
 ```
-127.0.0.1, 10.0.0.152, {$ORACLE_PUBLIC_IP}, myproj2.dpdns.org {
+127.0.0.1, 10.0.0.152, {$ORACLE_PUBLIC_IP}, <你的網域> {
 ```
 存檔後套用：
 ```bash
@@ -443,7 +443,7 @@ sudo systemctl restart caddy
 
 **④ 驗證**
 ```bash
-curl https://myproj2.dpdns.org/healthz   # 注意這次不用加 -k，能正常回應才代表 Cloudflare 憑證真的生效了
+curl https://<你的網域>/healthz   # 注意這次不用加 -k，能正常回應才代表 Cloudflare 憑證真的生效了
 ```
 
 **⑤（建議，可以晚點做）收緊 OCI Security List**，只允許 Cloudflare 的 IP 段連進 443，
@@ -611,7 +611,7 @@ https://<你的網域>/discord/interactions
 ```
 
 （用方案 B／C 就是自己的正式網域；用 Step 4-D 的 Cloudflare 代管憑證，就是
-Cloudflare 那筆 DNS 記錄設定的網域，例如 `myproj2.dpdns.org`）
+Cloudflare 那筆 DNS 記錄設定的網域，例如 `<你的網域>`）
 
 **按下儲存的瞬間，Discord 會立刻打一次 PING 過去驗證**——這一步能不能過，取決於
 Step 2 的 `bot-gateway` 有沒有正常跑起來、`DISCORD_PUBLIC_KEY` 有沒有填對、以及
