@@ -1,4 +1,17 @@
-# FinFlow 分散式邊緣運算系統部署指南（v17，Step 1 改用 requirements.txt，SELinux 說明就地補齊）
+# FinFlow 分散式邊緣運算系統部署指南（v18，Step 4 改寫為完整教學，新增 Cloudflare 方案 D）
+
+> 本輪（v18）把原本過於簡略的「Step 4：啟用 HTTPS」整段改寫成手把手教學：從 OCI
+> Cloud Shell 怎麼連進 Oracle VM 開始，`setup-https.sh` 內部每一步在做什麼都拆成表格
+> 逐條解釋，OCI 主控台開放 443 的每個點擊位置也寫清楚。新增「Step 4-D：改用 Cloudflare
+> 代管憑證」，把先前對話中討論過的 Cloudflare Proxy＋Full 加密模式接法正式寫進文件，
+> 作為 Discord 需要受信任憑證時的解法（原本方案 A 的自簽憑證無法滿足 Discord
+> Interactions Endpoint 的要求）。另外新增「Step 4 疑難排解」，把這幾輪對話裡真的
+>踩過的坑（無 SNI 找不到憑證、Caddyfile 語法錯誤、環境變數替換成空字串、203/EXEC）
+> 整理成對照表，方便之後重新部署或交接給別人時快速定位問題。
+
+> 前一版（v17）差異：Step 1 統一改用 `pip install -r requirements.txt`（原本是直接
+> `pip install fastapi uvicorn pydantic requests`，跟 `bot-gateway/` 的安裝方式不一致，
+> 已確認並統一）；Step 4.5 補上 `bot-gateway/venv` 的 SELinux relabel 就地說明。
 
 > 本輪（v17）處理上一版留下的待確認事項與兩個文件缺口：**Step 1 確認改為 `pip install -r
 > requirements.txt`**（原本用 `pip install fastapi uvicorn pydantic requests` 純粹是舊版
@@ -267,29 +280,198 @@ grep -n "^@app.get(\"/jobs" server.py
 
 ## Step 4：啟用 HTTPS
 
-`Caddyfile` 跟 `setup-https.sh` 現在都改成從 `finflow-queue.env` 讀 `ORACLE_PUBLIC_IP`，
-不再把真實公開 IP 寫死進這兩個會被 commit 的檔案（用法跟 Step 3 的金鑰分離是同一套邏輯）。
-執行前**務必先確認 Step 2 的 `finflow-queue.env` 裡 `ORACLE_PUBLIC_IP` 已經填好**，腳本會在
-一開始檢查這個值，沒填會直接報錯退出：
+這一節目標：讓 Oracle 上的 `server.py`／`bot_gateway.py`（分別跑在 127.0.0.1:8000／8001，
+只聽本機、外部連不到）透過 Caddy 這個反向代理，統一用 443（HTTPS）對外提供服務。
+下面從「怎麼連進 Oracle VM」開始，每一條指令都附註解，照抄執行即可。
+
+### 4-1：用 OCI Cloud Shell 連進 Oracle VM
+
+1. 瀏覽器打開 [cloud.oracle.com](https://cloud.oracle.com)，登入你的帳號
+2. 畫面**右上角**有一排小圖示，找到一個像「終端機／`>_`」的圖示，點下去——這個就是
+   **Cloud Shell**，OCI 直接在瀏覽器裡給你的一個小型 Linux 環境，不需要自己的電腦裝
+   任何 SSH 工具
+3. Cloud Shell 開起來後（第一次會花約 1 分鐘初始化），輸入以下指令連進你的 Oracle VM：
 
 ```bash
+# ssh 連線到你的 Oracle Compute 執行個體
+# opc 是 Oracle Linux 映像檔預設的管理帳號
+# 後面接你的 VM 公開 IP（在 OCI Console → Compute → Instances 頁面可以查到）
+ssh opc@158.101.16.137
+```
+
+第一次連線會問你要不要信任這台主機的指紋，輸入 `yes` 按 Enter。如果你是用自己的
+SSH 金鑰而不是 Cloud Shell 內建的，指令會多一個 `-i` 參數指定金鑰檔案路徑，例如
+`ssh -i ~/.ssh/oci_key opc@158.101.16.137`。
+
+連進去之後，命令列提示字元會變成 `[opc@ai-computing-edge ~]$` 這種樣子（`ai-computing-edge`
+換成你自己的主機名稱），代表你現在在 Oracle VM 裡面操作，不是在 Cloud Shell 本身了。
+
+### 4-2：進到專案資料夾，確認需要的檔案都在
+
+```bash
+# 切換到 repo clone 下來的資料夾（Step 1 已經建立過）
+cd /home/opc/finflow-queue
+
+# 列出這一步需要用到的四個檔案，確認都存在
+# Caddyfile：反向代理規則設定
+# setup-https.sh：自動化安裝腳本
+# caddy-override.conf：讓 caddy 服務讀取到公開 IP 的 systemd 外掛設定
+# finflow-queue.env：機敏設定檔，ORACLE_PUBLIC_IP 要先填在這裡面
+ls Caddyfile setup-https.sh caddy-override.conf finflow-queue.env
+```
+四個檔名都要被列出來、沒有「No such file or directory」才能繼續。
+
+### 4-3：確認 `ORACLE_PUBLIC_IP` 已經填好
+
+`setup-https.sh` 一啟動就會檢查這個值，沒填會直接報錯中止，先確認：
+
+```bash
+# grep 篩選出這一行，快速檢查有沒有填值
+grep ORACLE_PUBLIC_IP finflow-queue.env
+```
+如果等號後面是空的，先編輯填上（把 IP 換成你自己的）：
+```bash
+# nano 是簡單的文字編輯器，Ctrl+O 存檔、Ctrl+X 離開
+nano finflow-queue.env
+# 找到這一行，改成：ORACLE_PUBLIC_IP=158.101.16.137
+```
+
+### 4-4：執行安裝腳本，逐段解釋它在做什麼
+
+```bash
+# 給腳本加上「可執行」權限，不然會出現 Permission denied
 chmod +x setup-https.sh
+
+# 用 sudo 執行（腳本內部要 dnf 安裝套件、寫系統設定檔，需要管理員權限）
 sudo ./setup-https.sh
 ```
 
-腳本內部流程：讀取 `ORACLE_PUBLIC_IP` → 安裝 Caddy → 複製 `Caddyfile` 到
-`/etc/caddy/Caddyfile`（檔案內容是 `{$ORACLE_PUBLIC_IP}` 佔位符，不是真實 IP）→
-把 `caddy-override.conf`（repo 裡的獨立檔案，內容是一條 `EnvironmentFile=`）複製到
-`caddy.service` 的 systemd drop-in 目錄，讓 Caddy 進程啟動時能讀到 `ORACLE_PUBLIC_IP`
-並代入 `{$ORACLE_PUBLIC_IP}` → 啟動 Caddy → 開防火牆。
+腳本會依序印出「步驟 0」到「步驟 6」，對應它實際在做的事，逐一說明：
 
-（為什麼不乾脆把 `caddy.service` 併入 `finflow-queue.service` 少維護一個服務？
-見本文件最上方版本說明的評估——已經是「全系統只有一份 env 檔」的狀態，合併服務
-本身沒有必要，還會製造權限模型衝突跟 log 混雜的新問題。）
+| 腳本步驟 | 實際做的事 | 為什麼要這樣做 |
+|---|---|---|
+| 步驟 0 | 讀取 `finflow-queue.env` 裡的 `ORACLE_PUBLIC_IP` | 真實公開 IP 不寫死進會被 git commit 的檔案，避免外洩（跟 Step 2 金鑰分離同一套邏輯） |
+| 步驟 1 | `sudo dnf makecache` 更新套件索引 | 確保等一下安裝 Caddy 時抓到的是最新版本資訊 |
+| 步驟 2 | 加入 Caddy 官方的 COPR repo、`dnf install caddy` | Oracle Linux 官方倉庫沒有 Caddy，COPR 是社群維護的額外套件庫 |
+| 步驟 3 | 把 `Caddyfile` 複製到 `/etc/caddy/Caddyfile` | `/etc/caddy/` 才是 Caddy 實際會讀取設定的路徑，repo 裡的只是原始檔案 |
+| 步驟 4 | 把 `caddy-override.conf` 複製到 `/etc/systemd/system/caddy.service.d/override.conf`，`daemon-reload` | 讓 `caddy.service` 這個 systemd 服務啟動時也能讀到 `ORACLE_PUBLIC_IP`（詳見文件開頭「為何不合併 caddy.service」的說明） |
+| 步驟 5 | `systemctl enable` + `restart caddy` | 開機自動啟動，並用剛剛套用的新設定重啟一次 |
+| 步驟 6 | `firewall-cmd` 開放 443 port | Oracle Linux 內建的 OS 層防火牆，跟 OCI 網路層的 Security List 是兩層不同的防火牆，兩層都要開 |
 
-別忘了到 OCI 控制台的 Security List 開放 443 port，這一步腳本做不到。
+如果任何一步印出 `ERROR` 就會直接停下來，把錯誤訊息貼給我即可。
+
+### 4-5：OCI 主控台開放 443（腳本做不到這步，要手動點）
+
+1. 瀏覽器回到 [cloud.oracle.com](https://cloud.oracle.com) 主控台（不是 Cloud Shell 那個分頁）
+2. 左上角「☰」選單 → **Networking** → **Virtual Cloud Networks**
+3. 點進你的 VCN（例如 `ai-computing-edge-vcn`）
+4. 左側選單找 **Security Lists**，點進去 → 點 **Default Security List**
+5. **Add Ingress Rules** 按鈕，填：
+   - Source CIDR：`0.0.0.0/0`（代表允許任何來源）
+   - IP Protocol：`TCP`
+   - Destination Port Range：`443`
+6. 存檔
+
+### 4-6：驗證
+
+回到 SSH 進去的那個終端機視窗：
+```bash
+curl -k https://127.0.0.1/healthz              # 本機測試，-k 表示不驗證憑證（自簽憑證本來就不受信任，這裡先跳過）
+curl -k https://158.101.16.137/healthz          # 換成你自己的 IP，測試走公網也通
+```
+兩個都要回 `{"status":"ok",...}` 才算這一步完成。
+
+---
+
+## Step 4-D：（選用）改用 Cloudflare 代管憑證，取代自簽憑證
+
+如果你已經有網域託管在 Cloudflare（例如 `myproj2.dpdns.org`），可以讓 Cloudflare 幫你
+處理對外憑證，這是唯一能滿足 **Discord Interactions Endpoint** 要求受信任憑證的簡便做法
+（`tls internal` 自簽憑證會被 Discord 直接拒絕，方案 A 過不了這關）。
+
+**原理**：啟用 Cloudflare 的橘色雲朵代理後，連線變成兩段：
+```
+Discord / 使用者  ──HTTPS（Cloudflare 的受信任憑證）──▶  Cloudflare  ──HTTPS（可以是自簽）──▶  Oracle
+```
+外部看到的永遠是 Cloudflare 出示的憑證，Oracle 端可以繼續用現有的 `tls internal` 自簽憑證，
+不需要额外去申請或安裝任何新憑證。
+
+**① Cloudflare 加一筆 DNS 記錄，指向 Oracle 公開 IP**
+
+Cloudflare Dashboard → 選你的網域 → **DNS** → **Add record**：
+- Type：`A`
+- Name：`@`（代表根網域本身）或自訂子網域，例如 `api`
+- IPv4 address：你的 Oracle 公開 IP
+- Proxy status：**打開橘色雲朵**（這步是關鍵，沒開的話流量不會經過 Cloudflare）
+
+**② 設定加密模式為「完整」（不是「自動 SSL/TLS」）**
+
+Cloudflare Dashboard → **SSL/TLS** → **Overview**，選 **完整（Full）**。
+**不要選「自動 SSL/TLS」**——那個模式會定期重新掃描並可能自動升級成「完整（嚴格）」，
+一旦升級就會開始驗證 Oracle 端憑證是不是受信任 CA 簽的，你的自簽憑證會驗證失敗，
+所有服務會在你沒注意到的情況下突然斷線。「完整」模式明確寫著「不進行憑證驗證，
+接受任何憑證，包括自簽憑證」，是固定、可預期的行為。
+
+**③ `Caddyfile` 加上這個網域名稱**
+
+回到 Oracle VM 的 SSH 視窗：
+```bash
+cd /home/opc/finflow-queue
+nano Caddyfile
+```
+找到站台位址那一行，在後面加上你的網域（逗號分隔，其他 `handle` 區塊都不用動）：
+```
+127.0.0.1, 10.0.0.152, {$ORACLE_PUBLIC_IP}, myproj2.dpdns.org {
+```
+存檔後套用：
+```bash
+sudo caddy validate --config Caddyfile   # 先驗證語法
+sudo cp Caddyfile /etc/caddy/Caddyfile
+sudo systemctl restart caddy
+```
+
+**④ 驗證**
+```bash
+curl https://myproj2.dpdns.org/healthz   # 注意這次不用加 -k，能正常回應才代表 Cloudflare 憑證真的生效了
+```
+
+**⑤（建議，可以晚點做）收緊 OCI Security List**，只允許 Cloudflare 的 IP 段連進 443，
+擋掉繞過 Cloudflare、直接打 Oracle 公開 IP 的流量。Cloudflare 官方 IP 清單：
+https://www.cloudflare.com/ips/ ——這步不急，先確認前面都跑通再處理。
+
+**`skip_install_trust` 跟 `caddy-override.conf` 都不用因為改用 Cloudflare 而拿掉**：
+前者處理的是 Oracle 端自己簽憑證時裝不進系統信任庫的問題，跟 Cloudflare 完全無關、
+Oracle 端還是繼續用自簽憑證；後者是因為 `Caddyfile` 站台位址列表裡還留著
+`{$ORACLE_PUBLIC_IP}`（保留直連 IP 除錯的能力），只要這個佔位符還在，就還是需要
+`caddy-override.conf` 把環境變數餵給 Caddy。真的確定以後只走 Cloudflare 網域、
+不需要直連 IP 除錯了，才需要把這個佔位符從位址列表移除。
+
+---
+
+## Step 4 疑難排解：這幾個坑都真實踩過
+
+**`tlsv1 alert internal error`**：通常是位址列表裡少了某個實際會被連到的身分
+（例如少了 VM 的私有 IP，或環境變數沒代入成功變成空字串），用
+`sudo journalctl -u caddy -f -o cat` 搭配 `curl -kv` 即時看 debug log 裡的
+`tls.handshake` 訊息，會明確告訴你 `identifier` 是什麼、有沒有找到對應憑證。
+
+**`Job for caddy.service failed`／`unknown subdirective`**：`Caddyfile` 語法錯誤，
+先跑 `sudo caddy validate --config Caddyfile` 會直接告訴你哪一行有問題，不要跳過
+這步直接硬套用。
+
+**`Expected another address but had '{'`**：`{$ORACLE_PUBLIC_IP}` 被替換成空字串，
+通常是因為用 `sudo caddy validate` 這種不透過 systemd 啟動的方式手動測試，沒有
+`caddy-override.conf` 幫忙注入環境變數；手動測試要自己先 `export`：
+```bash
+export $(grep ORACLE_PUBLIC_IP finflow-queue.env)
+sudo -E caddy validate --config Caddyfile
+```
+
+**`code=exited, status=203/EXEC`**：跟 HTTPS 本身無關，是 SELinux 擋下執行檔，
+或是 systemd unit 裡的路徑寫錯，見 Step 3、Step 4.5 的 SELinux 說明。
 
 ## Step 4.5：部署 Bot Gateway（Telegram / LINE middleware，補上 8001 的洞）
+
 
 `Caddyfile` 裡的 `/telegram/*`、`/line/*` 會轉發到 `127.0.0.1:8001`，這一步就是把監聽在
 8001 的服務建起來。**必須先完成 Step 1-4（Oracle 核心端 + HTTPS）**，因為這個服務會呼叫
@@ -711,6 +893,17 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v18（本次）
+
+原本「Step 4：啟用 HTTPS」只有短短幾行、直接叫你跑 `setup-https.sh`，對第一次操作
+OCI 的人來說太跳躍。這輪整段重寫成手把手教學，並把 Cloudflare 接法正式寫進文件。
+
+| 檔案 | 變更 |
+|------|------|
+| `DEPLOY.md`（本檔） | Step 4 新增「4-1 用 Cloud Shell 連進 VM」到「4-6 驗證」六個小節，每條指令都附註解；`setup-https.sh` 內部六個步驟拆成表格逐條解釋在做什麼、為什麼要這樣做；OCI 主控台開放 443 的操作路徑寫成逐點擊步驟 |
+| `DEPLOY.md`（本檔） | 新增「Step 4-D：改用 Cloudflare 代管憑證」，說明兩段式加密原理、DNS 記錄設定、為什麼選「完整」而非「自動 SSL/TLS」、`Caddyfile` 加網域名稱的做法，以及 `skip_install_trust`／`caddy-override.conf` 為何在改用 Cloudflare 後仍要保留 |
+| `DEPLOY.md`（本檔） | 新增「Step 4 疑難排解」，整理這幾輪對話裡實際踩過的四個坑（無 SNI 找不到憑證、Caddyfile 語法錯誤、環境變數替換成空字串、203/EXEC）跟對應排查指令 |
 
 ### v17（本次）
 
