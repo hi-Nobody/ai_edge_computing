@@ -1038,10 +1038,18 @@ python3 register_discord_commands.py --set admin
 push 應該會直接建立一個新的（這是 Kaggle API 一般的行為），但保險起見，第一次
 建議先手動確認一次 Kaggle 個人頁面有沒有正確出現這個 kernel。
 
-**GPU 型號無法透過 API 指定**：`edge-worker/kaggle-kernel/kernel-metadata.json.template`
-裡的 `enable_gpu` 只能開/關，沒有辦法像網頁版下拉選單那樣明確指定「T4 x2」，
-實際分配到哪種 GPU 由 Kaggle 依你帳號當下的配額決定，不保證每次都跟手動操作時
-選的一樣。
+**GPU 型號可以指定「種類」，但不保證「數量」**：`kaggle kernels push` 有一個
+`--accelerator` 參數（例如 `NvidiaTeslaT4`），可以在 `NODE_PLATFORM_MAP` 這個
+節點的設定裡加 `"accelerator": "NvidiaTeslaT4"` 來指定，`node_controllers/kaggle.py`
+會自動帶進 push 指令；不填就交給 Kaggle 依當下配額自動分配。**但目前沒有已知
+方式能保證拿到「兩張」**（例如你手動操作時選的 T4 x2），這件事 Kaggle 官方論壇
+上還有未解決的討論串在問，數量無法透過 API 強制指定。另外 `enable_gpu` 跟
+`enable_tpu` 是完全獨立的兩個開關（見 `kernel-metadata.json.template`，只開了
+`enable_gpu`），不會因為要 GPU 就意外分配到 TPU；但如果帳號當週 GPU 配額已經
+用完，`enable_gpu: true` 這個請求實際上會發生什麼事（push 失敗、或退回 CPU
+執行），目前沒有查到明確可信賴的資料能保證答案，這點誠實列為未確認事項——
+即使真的退回 CPU，`bootstrap.py` 也不會整個當掉（`detect_vram()` 抓不到 GPU
+時走既有的寬鬆放行邏輯），只是推論速度會慢到不可行，屬於效能問題而非當機問題。
 
 照 Step 5 的方式把 Bot 邀進你的管理伺服器（OAuth2 → URL Generator → 勾選
 `applications.commands`）。
@@ -1158,10 +1166,12 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 | `DEPLOY.md`（本檔） | 新增「Step 5.7：遠端節點群控」完整章節 |
 | （清理）根目錄 `bootstrap.py`／`edge.conf`／`bot_gateway.py` | 移除——這三個是先前散落在根目錄、跟 `edge-worker/`／`bot-gateway/` 底下正本分岔的過期拷貝，統一以子資料夾版本為準 |
 
-**已知限制／待確認事項**（誠實列出，不是本輪能完全解決的）：
-1. Kaggle 官方 API 沒有辦法透過 `kernel-metadata.json` 指定明確的 GPU 型號/數量（例如 T4 x2），只能開關 `enable_gpu`，實際分配到哪種 GPU 由 Kaggle 依帳號當下配額決定
-2. `kaggle kernels push` 目前沒有已知的方式能設定「kernel 最長執行時間」，`KAGGLE_HARD_TIMEOUT_SEC` 這個環境變數目前只作為文件記錄，尚未真的接上任何 API 參數（見 `node_controllers/kaggle.py` 的說明）
+**已知限制／待確認事項**（誠實列出，不是本輪能完全解決的；1、2 兩點是這次追加
+查證後修正過的，原本的說法不夠準確）：
+1. Kaggle 的 `--accelerator` CLI 參數可以指定 GPU「型號」（例如 `NvidiaTeslaT4`），但目前沒有已知方式能保證拿到「數量」（例如 T4 x2），這件事 Kaggle 官方論壇上還有未解決的討論串在問；帳號 GPU 配額用完時 `enable_gpu: true` 實際會發生什麼事（push 失敗或退回 CPU）沒有查到明確可信賴的資料，誠實列為未確認
+2. `kaggle kernels push -t <SECONDS>` 官方文件顯示是設定「kernel 最長執行時間」，已經接上 `KAGGLE_HARD_TIMEOUT_SEC`（先前誤以為做不到，已修正）
 3. 全新的 `kernel_slug` 第一次 push 應該會自動建立 kernel（Kaggle API 一般行為），但沒有實際驗證過，第一次使用建議手動到 Kaggle 頁面確認
+4. `kernel-metadata.json.template` 原本誤放了一個 `_comment` 欄位方便寫說明，但 JSON 沒有註解語法，這個多出來的欄位很可能會被 Kaggle API 當成未知欄位拒絕整次 push，已移除，說明改放在這份文件裡
 
 ### v19（本次）
 

@@ -99,12 +99,32 @@ class KaggleController(NodeController):
                 )
                 (tmp_path / "kernel-metadata.json").write_text(meta_content, encoding="utf-8")
 
+                # --accelerator 是 kaggle CLI 的參數（不是寫在 kernel-metadata.json
+                # 裡），可以指定要哪一種加速器（例如 NvidiaTeslaT4），修正先前
+                # 誤以為「完全無法指定型號」的說法——型號可以選，但目前沒有已知
+                # 方式能保證拿到「兩張」（例如 T4 x2），這件事 Kaggle 官方論壇上
+                # 也還有未解決的討論串在問。NODE_PLATFORM_MAP 沒填 accelerator
+                # 就交給 Kaggle 預設分配。
+                #
+                # -t/--timeout 是這次 kernel 執行本身的最長時間上限（不是推送動作
+                # 的逾時），用 KAGGLE_HARD_TIMEOUT_SEC 當作安全網：即使
+                # IDLE_STOP_SEC、遠端停止信號都沒有正常觸發，Kaggle 官方也會在
+                # 這個時間強制結束，不會無限期燒 GPU 配額。
+                push_cmd = [
+                    "kaggle", "kernels", "push", "-p", str(tmp_path),
+                    "-t", str(KAGGLE_HARD_TIMEOUT_SEC),
+                ]
+                accelerator = node_config.get("accelerator")
+                if accelerator:
+                    push_cmd += ["--accelerator", accelerator]
+
                 result = subprocess.run(
-                    ["kaggle", "kernels", "push", "-p", str(tmp_path)],
+                    push_cmd,
                     env=_kaggle_env(),
                     capture_output=True,
                     text=True,
-                    timeout=60,  # 只是「推送」本身的逾時，不是節點執行時間的逾時
+                    timeout=60,  # 這是「推送指令本身」在本機執行的逾時，
+                                 # 跟上面 -t 控制的「kernel 執行時間」是兩回事
                 )
                 # 注意：kaggle CLI 的 -t/--timeout 是「這次 push 動作」本身的
                 # 逾時參數，不是設定 kernel 執行多久後強制停止的參數——目前
