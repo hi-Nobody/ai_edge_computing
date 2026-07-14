@@ -1,4 +1,22 @@
-# FinFlow 分散式邊緣運算系統部署指南（v19，Discord Bot 建立步驟改為六步驟＋discord-admin.env）
+# FinFlow 分散式邊緣運算系統部署指南（v20，新增 Kaggle／Lightning 遠端節點群控）
+
+> 本輪（v20）新增「Step 5.7：遠端節點群控」——在 Discord 下 `/start-node`、
+> `/stop-node`、`/list-nodes` 就能遠端開關 Kaggle／Lightning 節點，不用再手動
+> 登入瀏覽器點 cell。核心設計：`server.py` 新增輕量的「停止信號」機制（Kaggle
+> 沒有官方遠端停止 API，只能靠節點自己配合輪詢檢查）；新增
+> `bot-gateway/node_controllers/` 套件封裝兩個平台的差異（Kaggle 只能
+> start、stop 靠信號；Lightning 有官方 `Studio.stop()`，能真正即時關閉）；
+> 管理指令刻意掛在**另一個獨立的 Discord bot**（`/discord/admin-interactions`，
+> 獨立的 `DISCORD_ADMIN_PUBLIC_KEY`），跟一般問答用的 `/ask` bot 權限分離；
+> Lightning 額外有一個獨立背景執行緒定期檢查心跳、閒置太久主動關閉 Studio
+> 省錢，設計上刻意讓這個背景執行緒的呼叫失敗/卡住都不會拖累
+> `bot_gateway.py` 處理其他訊息、也完全不影響 `server.py`（`server.py`
+> 依然保持零平台知識）。另外把先前散落在根目錄的重複／過期
+> `bootstrap.py`／`edge.conf`／`bot_gateway.py` 清掉，統一以
+> `edge-worker/`、`bot-gateway/` 底下的為準。
+
+> 前一版（v19）差異：把「建立 Discord Bot」小節重寫成六步驟流程，新增
+> `discord-admin.env` 管理一次性腳本專用的機密資訊。
 
 > 本輪（v19）把「建立 Discord Bot」小節重寫成更詳細的六步驟流程（實際跑過一次部署
 > 才整理出來的順序），並把 `DISCORD_BOT_TOKEN`／`DISCORD_APPLICATION_ID` 這兩把
@@ -939,6 +957,122 @@ python g4f_worker.py
 給佇列，讓佇列走正常的重試/DLQ 流程」，不需要額外介入。長期穩定用途還是建議以
 Ollama 邊緣節點（Step 5）為主，這個當備援。
 
+## Step 5.7：（選用）遠端節點群控——用 Discord 遠端啟閉 Kaggle／Lightning 節點
+
+Step 5 的邊緣節點端啟動，本來需要手動打開瀏覽器、登入 Kaggle/Lightning、一格一格
+執行 cell。這一節補上「在 Discord 下指令、遠端啟動/停止節點」的功能，架構上分成
+四塊：`server.py` 的停止信號機制、`bot-gateway/node_controllers/` 平台控制模組、
+一個**獨立**的 Discord 管理 bot、以及 Kaggle／Lightning 各自的啟動腳本模板。
+
+### 平台能力不對稱，這是 Kaggle／Lightning 官方限制，不是本專案的 bug
+
+| | Kaggle | Lightning AI |
+|---|---|---|
+| 遠端啟動 | ✅ `kaggle kernels push`（官方 API） | ✅ `lightning_sdk.Studio.start()`（官方 SDK） |
+| 遠端停止 | ❌ **官方 API 完全沒有**（[長年未實作的功能請求](https://github.com/Kaggle/kaggle-api/issues/388)） | ✅ `Studio.stop()`，官方支援即時關閉 |
+| 停止的實際做法 | 只能靠 server.py 的 `stop_requested` 信號，等節點自己在下次輪詢（通常 2 秒內）讀到後自行結束 process，Kaggle 才會判定 kernel run 執行完畢、回收 GPU session | 直接呼叫官方 API，立即生效 |
+| 閒置自動關閉 | 只能靠 `bootstrap.py` 自己的 `IDLE_STOP_SEC`（節點自己判斷、自己結束） | `bootstrap.py` 的 `IDLE_STOP_SEC` 是第一層；`bot_gateway.py` 另外有一個獨立背景執行緒定期檢查心跳，超過 `LIGHTNING_IDLE_TIMEOUT_SEC` 就主動呼叫 `Studio.stop()` 當保底（涵蓋節點自己當機、或 `IDLE_STOP_SEC` 沒有真的觸發到的情況） |
+
+### 為什麼 Kaggle 的啟動腳本要「前景執行」，不能像手動操作時那樣背景 Popen
+
+你們手動操作時用 `subprocess.Popen` 背景啟動 `bootstrap.py`，是為了繞開 Kaggle
+互動視窗擋 `!command &` 的限制。但透過 API 觸發的批次執行，Kaggle 判定「這次 run
+是否執行完畢」的依據是「腳本本身有沒有跑完」——如果腳本背景啟動 `bootstrap.py` 後
+自己就返回了，Kaggle 會認為這次 run 已經結束，可能提早回收 GPU session，
+`bootstrap.py` 才剛開始跑就被中斷。所以 `edge-worker/kaggle-kernel/` 底下的模板
+故意用**前景**直接執行（見該模板檔案開頭的說明），這樣 `IDLE_STOP_SEC` 或收到
+`stop_requested` 信號讓 `bootstrap.py` 結束時，才會正確對應到「這次 Kaggle
+session 真正結束」。Lightning 因為是持久 VM、不是批次執行模型，沒有這個限制，
+可以正常背景執行。
+
+### 1. 建立第二個 Discord Bot（管理專用，跟 `/ask` 分開）
+
+刻意跟 Step 4.5 的 `/ask` bot 是不同的 Discord Application：一般使用者只該看到
+`/ask`，節點的開關不該讓每個能問問題的人都能操作。照 Step 4.5「建立 Discord Bot」
+同樣的步驟，**再建立一個全新的 Application**，這次要記下的東西一樣是
+Application ID、Public Key、Bot Token，只是這組要填進不同的地方（見下）。
+
+### 2. `finflow-queue.env` 補上這些設定
+
+```bash
+DISCORD_ADMIN_PUBLIC_KEY=<剛剛第二個 bot 的 Public Key>
+
+NODE_PLATFORM_MAP={"kaggle-1":{"platform":"kaggle","kernel_slug":"finflow-edge-kaggle-1"},"lightning-1":{"platform":"lightning","studio_name":"finflow-edge-1","teamspace":"<你的 teamspace 名稱>"}}
+
+KAGGLE_USERNAME=<Kaggle 帳號 -> Settings -> API -> Create New Token 下載的 kaggle.json 裡的值>
+KAGGLE_KEY=<同上>
+
+LIGHTNING_USER_ID=<Lightning 後台 -> Settings -> API Keys>
+LIGHTNING_API_KEY=<同上>
+
+LIGHTNING_IDLE_TIMEOUT_SEC=1800
+LIGHTNING_IDLE_CHECK_INTERVAL_SEC=60
+```
+
+存檔後重啟 `bot-gateway`：
+
+```bash
+sudo systemctl restart bot-gateway
+sudo systemctl status bot-gateway --no-pager -l
+```
+
+### 3. 註冊管理指令（`/start-node`、`/stop-node`、`/list-nodes`）
+
+```bash
+cd /home/opc/finflow-queue/bot-gateway
+source venv/bin/activate
+source discord-admin.env   # 這裡面要換成「第二個 bot」的 DISCORD_BOT_TOKEN／
+                            # DISCORD_APPLICATION_ID，不是 /ask 那個 bot 的
+export NODE_PLATFORM_MAP='<跟 finflow-queue.env 裡填的一樣，讓 node_id 變成下拉選單>'
+python3 register_discord_commands.py --set admin
+```
+
+管理指令預設加了 `default_member_permissions`（需要 Manage Server 權限），
+一般成員即使在同一個頻道也看不到這三個指令，不需要額外設定頻道權限。
+
+### 4. Kaggle 節點：確認 kernel_slug、把 Bot 邀進管理伺服器
+
+`NODE_PLATFORM_MAP` 裡 Kaggle 節點的 `kernel_slug`，對應 `kaggle kernels push`
+實際會建立/更新的 kernel 名稱（完整會是 `<KAGGLE_USERNAME>/<kernel_slug>`）。
+第一次 `/start-node` 觸發時，如果這個 slug 在你的 Kaggle 帳號底下還不存在，
+push 應該會直接建立一個新的（這是 Kaggle API 一般的行為），但保險起見，第一次
+建議先手動確認一次 Kaggle 個人頁面有沒有正確出現這個 kernel。
+
+**GPU 型號無法透過 API 指定**：`edge-worker/kaggle-kernel/kernel-metadata.json.template`
+裡的 `enable_gpu` 只能開/關，沒有辦法像網頁版下拉選單那樣明確指定「T4 x2」，
+實際分配到哪種 GPU 由 Kaggle 依你帳號當下的配額決定，不保證每次都跟手動操作時
+選的一樣。
+
+照 Step 5 的方式把 Bot 邀進你的管理伺服器（OAuth2 → URL Generator → 勾選
+`applications.commands`）。
+
+### 5. Lightning 節點：先在後台建立好 Studio
+
+`NODE_PLATFORM_MAP` 裡 Lightning 節點的 `studio_name`、`teamspace`，必須是你已經
+在 Lightning AI 後台手動建立好的 Studio（`Studio.start()` 是「啟動已存在的
+Studio」，不是「建立一個新的」）。第一次使用前，先手動到 Lightning 網頁建立一次，
+之後靠 `/start-node`／`/stop-node` 遠端開關就好，不需要每次都重建。
+
+### 6. 實測
+
+在管理伺服器裡：
+
+```
+/list-nodes
+/start-node node_id:kaggle-1
+```
+
+`/start-node` 會先回「思考中…」（deferred），因為呼叫 Kaggle/Lightning API 本身
+需要幾秒到幾十秒，之後會編輯成成功/失敗訊息。開機、裝 Ollama、拉模型可能還要再等
+幾分鐘，用 `/list-nodes` 確認節點是否真的上線（心跳有沒有送達）。
+
+```
+/stop-node node_id:kaggle-1
+```
+
+Kaggle 節點的回覆會明確告訴你「這是送出信號，不是立即確認關閉」；Lightning
+節點如果 API 呼叫成功，回覆會是「已即時關閉」。
+
 ## Step 6：驗證
 
 **分層檢查**（愈底層先過，愈容易定位問題出在哪一層）：
@@ -1001,6 +1135,33 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v20（本次）
+
+新增遠端節點群控功能，讓 Kaggle／Lightning 節點可以透過 Discord 指令遠端啟動/
+停止，不用再手動登入瀏覽器操作。詳細架構決策（為什麼 Kaggle／Lightning 要分開
+處理、為什麼閒置監控放在 `bot_gateway.py` 而不是 `server.py`、為什麼要用兩個
+獨立的 Discord bot）見對話紀錄，這裡只列檔案異動：
+
+| 檔案 | 變更 |
+|------|------|
+| `server.py` | `nodes` 表新增 `stop_requested` 欄位（含既有部署的遷移邏輯）；新增 `POST /nodes/{node_id}/stop` 管理端點；`GET /jobs/next` 回應新增 `stop_requested` 欄位，讀到即清除（一次性通知，不是持續狀態）；升級至 v5 |
+| `edge-worker/bootstrap.py` | `ensure_ollama()` 安裝前先確保 `zstd` 存在（修正 Kaggle 上手動才需要額外裝 `zstd` 的問題，從此不用再手動跑一次）；主輪詢迴圈新增檢查 `/jobs/next` 回應的 `stop_requested`，為 true 時呼叫既有的 `shutdown()`；升級至 v6 |
+| `bot-gateway/node_controllers/`（新增套件） | `base.py` 定義平台無關的共用介面（`StartResult`／`StopResult`，刻意用 `confirmed` 欄位呈現 Kaggle／Lightning 能力不對稱）；`kaggle.py` 用官方 `kaggle` CLI 觸發 script 型 kernel；`lightning.py` 用官方 `lightning_sdk` 直接呼叫 `Studio.start()`/`Studio.stop()`；`__init__.py` 提供 `get_controller()`／`get_node_config()` 給 `bot_gateway.py` 用，讀取 `NODE_PLATFORM_MAP` |
+| `bot-gateway/bot_gateway.py` | 新增 `/discord/admin-interactions` 端點（獨立的 `DISCORD_ADMIN_PUBLIC_KEY` 驗證），處理 `/start-node`／`/stop-node`／`/list-nodes` 三個指令；`verify_discord_signature()` 改成接受任意 public key 參數，同時服務兩個獨立的 bot；所有節點操作都走「deferred 回應 + BackgroundTask + `run_in_executor`」，避免 Kaggle/Lightning 的同步 SDK 呼叫卡住 FastAPI 事件迴圈；新增獨立背景執行緒 `_lightning_idle_checker_loop()` 定期檢查心跳，超時主動呼叫 `Studio.stop()` |
+| `bot-gateway/register_discord_commands.py` | 從單一 `COMMAND_PAYLOAD` 改成 `COMMAND_SETS`（`ask`／`admin` 兩組），新增 `--set` 參數選擇要註冊哪一組；`admin` 組的三個指令加上 `default_member_permissions`（需要 Manage Server 權限），一般成員看不到；`node_id` 參數如果偵測到環境變數裡有 `NODE_PLATFORM_MAP`，自動變成下拉選單 |
+| `bot-gateway/requirements.txt` | 新增 `kaggle`、`lightning-sdk`、`requests`（閒置監控執行緒用同步的 `requests`，不跟 `httpx.AsyncClient` 混用） |
+| `edge-worker/kaggle-kernel/`（新增） | `kernel_script.py.template`、`kernel-metadata.json.template`——Kaggle script 型 kernel 的模板，由 `node_controllers/kaggle.py` 在推送前動態帶入實際值；模板故意用**前景**執行 `bootstrap.py`（不是背景 `Popen`），原因見 DEPLOY.md「Step 5.7」的說明 |
+| `finflow-queue.env` | 新增 `DISCORD_ADMIN_PUBLIC_KEY`、`NODE_PLATFORM_MAP`、`KAGGLE_USERNAME`、`KAGGLE_KEY`、`LIGHTNING_USER_ID`、`LIGHTNING_API_KEY`、`LIGHTNING_IDLE_TIMEOUT_SEC`、`LIGHTNING_IDLE_CHECK_INTERVAL_SEC` |
+| `bot-gateway/bot-gateway.service` | `Description` 補上節點群控說明；其餘不變（新環境變數都透過既有的 `EnvironmentFile=finflow-queue.env` 涵蓋，不需要新增 `Environment=` 行） |
+| `Caddyfile` | 註解更新：說明 `/discord/*` 萬用字元已涵蓋新的 `/discord/admin-interactions` 端點，不需要新增規則 |
+| `DEPLOY.md`（本檔） | 新增「Step 5.7：遠端節點群控」完整章節 |
+| （清理）根目錄 `bootstrap.py`／`edge.conf`／`bot_gateway.py` | 移除——這三個是先前散落在根目錄、跟 `edge-worker/`／`bot-gateway/` 底下正本分岔的過期拷貝，統一以子資料夾版本為準 |
+
+**已知限制／待確認事項**（誠實列出，不是本輪能完全解決的）：
+1. Kaggle 官方 API 沒有辦法透過 `kernel-metadata.json` 指定明確的 GPU 型號/數量（例如 T4 x2），只能開關 `enable_gpu`，實際分配到哪種 GPU 由 Kaggle 依帳號當下配額決定
+2. `kaggle kernels push` 目前沒有已知的方式能設定「kernel 最長執行時間」，`KAGGLE_HARD_TIMEOUT_SEC` 這個環境變數目前只作為文件記錄，尚未真的接上任何 API 參數（見 `node_controllers/kaggle.py` 的說明）
+3. 全新的 `kernel_slug` 第一次 push 應該會自動建立 kernel（Kaggle API 一般行為），但沒有實際驗證過，第一次使用建議手動到 Kaggle 頁面確認
 
 ### v19（本次）
 

@@ -1,0 +1,41 @@
+"""
+Kaggle script 型 kernel 的模板 —— 由 bot-gateway/node_controllers/kaggle.py
+在推送前用 string.Template 把 ${...} 佔位符換成實際值，換完的版本才會被
+`kaggle kernels push` 上傳並執行。這份檔案本身不會被直接執行，repo 裡留著
+純粹是方便你看懂 Kaggle 那邊實際跑的內容、以及手動除錯時對照用。
+
+跟你們之前手動操作的差異：
+    - 不需要手動 apt-get install zstd（bootstrap.py 的 ensure_ollama() 已經
+      會自己處理，見 v6 變更）
+    - 不需要 subprocess.Popen 背景啟動：這裡故意用前景直接執行
+      （最後一行沒有加 & 或用 nohup），因為 Kaggle 判定「這次 run 是否
+      執行完畢」的依據就是「腳本本身有沒有跑完」，前景執行才能讓
+      IDLE_STOP_SEC／遠端停止信號正確對應到「這次 Kaggle session
+      真正結束、GPU 配額被釋放」，不是只有輪詢迴圈自己停了但 session
+      還開著繼續計時
+"""
+
+import subprocess
+import sys
+import urllib.request
+
+EDGE_CONF = """ORACLE_URL=${ORACLE_URL}
+NODE_ID=${NODE_ID}
+NODE_API_KEY=${NODE_API_KEY}
+MODEL_NAME=${MODEL_NAME}
+VERIFY_TLS=${VERIFY_TLS}
+INFERENCE_TIMEOUT_SEC=${INFERENCE_TIMEOUT_SEC}
+IDLE_STOP_SEC=${IDLE_STOP_SEC}
+"""
+
+with open("edge.conf", "w", encoding="utf-8") as f:
+    f.write(EDGE_CONF)
+
+# bootstrap.py 只有一份權威版本在 repo 裡，這裡每次都重新下載最新版，
+# 不在 Kaggle kernel 裡另外維護一份容易分岔的拷貝
+urllib.request.urlretrieve("${BOOTSTRAP_URL}", "bootstrap.py")
+
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "requests"], check=True)
+
+# 前景執行，見檔頭說明——不要在這裡改成背景或加 &
+subprocess.run([sys.executable, "bootstrap.py"], check=False)

@@ -1,5 +1,12 @@
 """
-FinFlow 任務佇列伺服器 v4 —— 在 Oracle Cloud 上運行
+FinFlow 任務佇列伺服器 v5 —— 在 Oracle Cloud 上運行
+
+新增功能（相對 v4）：
+  9. 新增節點遠端停止信號機制：nodes 表加上 stop_requested 欄位，
+     POST /nodes/{node_id}/stop（管理端點）可標記某節點「請盡快停止」，
+     節點會在下一次 GET /jobs/next 輪詢時讀到並自行結束——這是配合
+     bot-gateway 的多平台節點群控功能新增的，server.py 本身仍然不知道
+     Kaggle／Lightning 是什麼，只單純提供「留言板」給節點跟控制端溝通
 
 本版以使用者提供的 Gemini 修改版（優先權、中斷偵測、DLQ、扁平化 nodes schema）
 為基礎，保留其有價值的改進，修正以下問題（詳細原因見對話說明，不在此重複）：
@@ -47,7 +54,7 @@ SESSION_COMPACT_KEEP_RECENT = int(os.environ.get("SESSION_COMPACT_KEEP_RECENT", 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-app = FastAPI(title="FinFlow Edge Queue (v4)")
+app = FastAPI(title="FinFlow Edge Queue (v5)")
 
 
 @app.get("/healthz")
@@ -96,9 +103,16 @@ def init_db():
             platform TEXT,
             current_model TEXT,
             vram_gb REAL,
-            last_heartbeat REAL
+            last_heartbeat REAL,
+            stop_requested INTEGER DEFAULT 0
         )
     """)
+    # 遷移：既有部署的 nodes 表可能是舊 schema，沒有 stop_requested 這欄。
+    # SQLite 沒有「ADD COLUMN IF NOT EXISTS」，用 try/except 吃掉「欄位已存在」的錯誤。
+    try:
+        conn.execute("ALTER TABLE nodes ADD COLUMN stop_requested INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # 欄位已存在（新建的表，或已經遷移過），忽略
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
@@ -439,6 +453,18 @@ def get_next_job(node_id: str, x_api_key: str = Header(None)):
 
     node_row = get_node_row(conn, node_id)
 
+    # 遠端停止信號：搭著節點本來就會每 2 秒輪詢一次的 /jobs/next 一起回傳，
+    # 不需要另開一支 API、也不會增加額外的輪詢負擔。Kaggle 沒有官方的遠端
+    # 停止 API（見 DEPLOY.md），只能靠這種「節點自己配合檢查」的方式；
+    # Lightning 雖然有官方 Studio.stop()，但這個欄位對所有平台一視同仁，
+    # 讓 bootstrap.py 的行為不因平台而異，簡化程式邏輯。
+    stop_requested = bool(node_row["stop_requested"]) if node_row else False
+    if stop_requested:
+        # 讀到即清除：這是「一次性通知」，不是持續狀態，避免節點下一輪
+        # 重新啟動時又莫名其妙立刻被要求停止
+        conn.execute("UPDATE nodes SET stop_requested = 0 WHERE node_id = ?", (node_id,))
+        conn.commit()
+
     rows = conn.execute("""
         SELECT id, payload, depends_on, required_capability FROM jobs
         WHERE status = 'pending'
@@ -464,10 +490,10 @@ def get_next_job(node_id: str, x_api_key: str = Header(None)):
         conn.execute("UPDATE jobs SET status = 'claimed', claimed_by = ?, claimed_at = ? WHERE id = ?", (node_id, time.time(), job_id))
         conn.commit()
         conn.close()
-        return {"job_id": job_id, "payload": json.loads(target_job["payload"])}
+        return {"job_id": job_id, "payload": json.loads(target_job["payload"]), "stop_requested": stop_requested}
 
     conn.close()
-    return {"message": "No pending jobs"}
+    return {"message": "No pending jobs", "stop_requested": stop_requested}
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(verify_client_key)])
@@ -527,6 +553,7 @@ def list_nodes():
             "node_id": r["node_id"],
             "alive": r["last_heartbeat"] > cutoff,
             "last_heartbeat": r["last_heartbeat"],
+            "stop_requested": bool(r["stop_requested"]),
             "capability": {
                 "platform": r["platform"],
                 "model": r["current_model"],
@@ -535,6 +562,26 @@ def list_nodes():
         }
         for r in rows
     ]
+
+
+@app.post("/nodes/{node_id}/stop", dependencies=[Depends(verify_client_key)])
+def request_node_stop(node_id: str):
+    """標記某個節點「請盡快自行停止」，不是立即強制關閉。
+    節點會在下一次 GET /jobs/next 輪詢（通常 2 秒內）讀到這個信號並自行結束
+    process；對於本身就有官方遠端關機 API 的平台（如 Lightning），
+    bot-gateway 的 node_controllers 會另外直接呼叫該平台的 stop API，
+    這個端點只負責「通知節點內部的 bootstrap.py」，兩者互補，不互斥
+    ——即使外部 stop 呼叫失敗，節點下一輪還是會自己檢查到這個信號。"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = get_node_row(conn, node_id)
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="node not found")
+    conn.execute("UPDATE nodes SET stop_requested = 1 WHERE node_id = ?", (node_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "stop_requested", "node_id": node_id}
 
 
 # ---------- 10. 背景容錯巡檢（修正問題一：補回自動執行緒；修正問題四：補上串聯失敗）----------

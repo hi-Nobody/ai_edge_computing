@@ -5,6 +5,9 @@
 # bot-gateway/ 目錄），這三條路由可以正常使用了。若尚未部署 bot-gateway，
 # 這幾段會回 502，屬預期行為。
 #
+# /discord/* 是萬用字元，節點群控新增的 /discord/admin-interactions 端點
+# （另一個獨立 Discord bot 用）已經涵蓋在這條路由裡，不需要另外加規則。
+#
 # 注意：Discord 的 Interactions Endpoint 驗證只接受受信任 CA 簽發的憑證，
 # 方案 A（下方的 tls internal 自簽憑證）無法通過 Discord 的端點驗證，
 # 要用 Discord 必須改用方案 B 或方案 C（詳見 DEPLOY.md「建立 Discord Bot」小節）。
@@ -24,7 +27,7 @@
 # 10.0.0.152 是 VCN 內部私有 IP，非機敏資訊，維持寫死無妨。
 # ============================================================
 
-127.0.0.1, 10.0.0.152, {$ORACLE_PUBLIC_IP}, myproj2.dpdns.org {
+127.0.0.1, 10.0.0.152, {$ORACLE_PUBLIC_IP}, {$DOMAIN_NAME} {
 	tls internal
 
 	handle /telegram/* {

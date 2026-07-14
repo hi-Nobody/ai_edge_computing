@@ -1,5 +1,5 @@
 [Unit]
-Description=FinFlow Bot Gateway (Telegram/LINE/Discord webhook middleware)
+Description=FinFlow Bot Gateway (Telegram/LINE/Discord webhook middleware + 節點群控)
 After=network.target finflow-queue.service
 Requires=finflow-queue.service
 

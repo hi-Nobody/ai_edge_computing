@@ -2,3 +2,6 @@ fastapi
 uvicorn
 httpx
 pynacl
+requests
+kaggle
+lightning-sdk

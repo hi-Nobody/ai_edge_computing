@@ -1,0 +1,14 @@
+{
+  "id": "${KAGGLE_USERNAME}/${KERNEL_SLUG}",
+  "title": "${KERNEL_TITLE}",
+  "code_file": "kernel_script.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "_comment": "enable_gpu 只能開/關，Kaggle API 目前沒有公開的欄位能像網頁版下拉選單那樣指定 GPU T4 x2 這種明確的加速器數量/型號，實際分配到哪種 GPU 由 Kaggle 依帳號當下的配額決定，不保證每次都跟你手動操作時選的一樣，這是官方 API 本身的限制，不是這份設定檔寫錯"
+}

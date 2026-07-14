@@ -1,5 +1,13 @@
 """
-FinFlow 邊緣節點啟動腳本 v5
+FinFlow 邊緣節點啟動腳本 v6
+
+新增功能（相對 v5）：
+  - ensure_ollama() 安裝前先確保 zstd 存在（Kaggle 等平台的基礎映像檔沒有
+    預裝，ollama 官方安裝腳本會直接失敗；Lightning 等平台如果已經有 zstd，
+    這步會直接跳過），從此不需要在啟動前手動另外執行 apt-get install zstd
+  - 主輪詢迴圈新增遠端停止信號檢查：GET /jobs/next 回應裡的 stop_requested
+    欄位為 true 時，呼叫既有的 shutdown() 自行結束，搭配 server.py 新增的
+    POST /nodes/{id}/stop 與 bot-gateway 的節點群控指令使用，見 DEPLOY.md
 
 新增功能（相對 v4）：
   - 單次推論逾時從寫死的 180 秒，改成可設定的 INFERENCE_TIMEOUT_SEC（預設 300 秒），
@@ -148,6 +156,15 @@ def ensure_ollama():
     import shutil
     if shutil.which("ollama") is None:
         log.info("偵測不到 Ollama，開始安裝...")
+        # 有些平台的基礎映像檔沒有預裝 zstd（實測 Kaggle 會直接讓 ollama 官方
+        # 安裝腳本失敗：ERROR: This version requires zstd for extraction），
+        # 這裡先確保它存在。用 shell=True 執行且不 check=True：這行只是儘量
+        # 幫忙裝，裝不成功（例如平台沒有 apt-get、或本來就有 zstd 不需要裝）
+        # 都不應該讓整個 ensure_ollama() 中斷，交給下一行真正的安裝指令自己
+        # 決定成敗
+        if shutil.which("zstd") is None:
+            log.info("偵測不到 zstd，嘗試安裝（Kaggle 等平台的 ollama 安裝腳本需要它）...")
+            subprocess.run("apt-get update -qq && apt-get install -y zstd -qq", shell=True)
         subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True)
     else:
         log.info("Ollama 已安裝，略過安裝步驟")
@@ -267,9 +284,14 @@ def worker_loop(vram_gb):
                 timeout=10,
                 verify=CONFIG["VERIFY_TLS"],
             )
-            if res.status_code == 200 and "job_id" in res.json():
-                job_id   = res.json()["job_id"]
-                messages = res.json()["payload"]["messages"]
+            res_data = res.json()
+
+            if res_data.get("stop_requested"):
+                shutdown("收到 Oracle 的遠端停止信號（Discord /stop-node 或 Lightning 閒置監控觸發）")
+
+            if res.status_code == 200 and "job_id" in res_data:
+                job_id   = res_data["job_id"]
+                messages = res_data["payload"]["messages"]
                 log.info(f"接到任務 {job_id}，開始推論...")
                 last_activity_at = time.time()  # 領到任務＝有活動，重置閒置計時
                 try:
