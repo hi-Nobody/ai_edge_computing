@@ -1,5 +1,14 @@
 """
-FinFlow 任務佇列伺服器 v5 —— 在 Oracle Cloud 上運行
+FinFlow 任務佇列伺服器 v6 —— 在 Oracle Cloud 上運行
+
+新增功能（相對 v5）：
+  10. nodes 表新增 gpu_name、gpu_count、started_at、status 欄位，
+      GET /nodes 一併回傳，供 /list-nodes 顯示實際分配到的 GPU 型號/數量
+  11. 新增 Kaggle 專用的兩階段啟動信號機制：POST /nodes/{node_id}/load
+      （管理端點）標記「可以開始佈署了」，GET /nodes/{node_id}/load-status
+      （節點自己輪詢用）讀取並清除這個信號。用途：Kaggle 的 GPU 型號/數量
+      是隨機分配的，先開機回報硬體資訊、等管理者確認滿意再真正下載模型，
+      避免分配到不夠用的規格卻已經浪費時間下載大模型
 
 新增功能（相對 v4）：
   9. 新增節點遠端停止信號機制：nodes 表加上 stop_requested 欄位，
@@ -54,7 +63,7 @@ SESSION_COMPACT_KEEP_RECENT = int(os.environ.get("SESSION_COMPACT_KEEP_RECENT", 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-app = FastAPI(title="FinFlow Edge Queue (v5)")
+app = FastAPI(title="FinFlow Edge Queue (v6)")
 
 
 @app.get("/healthz")
@@ -104,15 +113,28 @@ def init_db():
             current_model TEXT,
             vram_gb REAL,
             last_heartbeat REAL,
-            stop_requested INTEGER DEFAULT 0
+            stop_requested INTEGER DEFAULT 0,
+            load_requested INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'running',
+            gpu_name TEXT,
+            gpu_count INTEGER,
+            started_at REAL
         )
     """)
-    # 遷移：既有部署的 nodes 表可能是舊 schema，沒有 stop_requested 這欄。
+    # 遷移：既有部署的 nodes 表可能是舊 schema，缺少下面這些欄位。
     # SQLite 沒有「ADD COLUMN IF NOT EXISTS」，用 try/except 吃掉「欄位已存在」的錯誤。
-    try:
-        conn.execute("ALTER TABLE nodes ADD COLUMN stop_requested INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass  # 欄位已存在（新建的表，或已經遷移過），忽略
+    for _migration_sql in (
+        "ALTER TABLE nodes ADD COLUMN stop_requested INTEGER DEFAULT 0",
+        "ALTER TABLE nodes ADD COLUMN load_requested INTEGER DEFAULT 0",
+        "ALTER TABLE nodes ADD COLUMN status TEXT DEFAULT 'running'",
+        "ALTER TABLE nodes ADD COLUMN gpu_name TEXT",
+        "ALTER TABLE nodes ADD COLUMN gpu_count INTEGER",
+        "ALTER TABLE nodes ADD COLUMN started_at REAL",
+    ):
+        try:
+            conn.execute(_migration_sql)
+        except sqlite3.OperationalError:
+            pass  # 欄位已存在（新建的表，或已經遷移過），忽略
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
@@ -205,8 +227,12 @@ class JobResult(BaseModel):
 class HeartbeatRequest(BaseModel):
     node_id: str
     platform: str
-    current_model: str
+    current_model: Optional[str] = None  # phase-A「開機中，尚未載入模型」時是 None
     vram_gb: Optional[float] = None
+    gpu_name: Optional[str] = None
+    gpu_count: Optional[int] = None
+    started_at: Optional[float] = None
+    status: str = "running"  # "booting"（Kaggle 兩階段啟動的第一階段）或 "running"（正常運作）
 
 
 # ---------- 4. 能力比對（修正問題二：重新接回比對邏輯）----------
@@ -528,13 +554,59 @@ def node_heartbeat(data: HeartbeatRequest, x_api_key: str = Header(None)):
     verify_node_key(data.node_id, x_api_key)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
-        INSERT INTO nodes (node_id, platform, current_model, vram_gb, last_heartbeat)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(node_id) DO UPDATE SET last_heartbeat=excluded.last_heartbeat, platform=excluded.platform, current_model=excluded.current_model, vram_gb=excluded.vram_gb
-    """, (data.node_id, data.platform, data.current_model, data.vram_gb, time.time()))
+        INSERT INTO nodes (node_id, platform, current_model, vram_gb, last_heartbeat, status, gpu_name, gpu_count, started_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(node_id) DO UPDATE SET
+            last_heartbeat=excluded.last_heartbeat,
+            platform=excluded.platform,
+            current_model=excluded.current_model,
+            vram_gb=excluded.vram_gb,
+            status=excluded.status,
+            gpu_name=excluded.gpu_name,
+            gpu_count=excluded.gpu_count,
+            started_at=excluded.started_at
+    """, (data.node_id, data.platform, data.current_model, data.vram_gb, time.time(),
+          data.status, data.gpu_name, data.gpu_count, data.started_at))
     conn.commit()
     conn.close()
     return {"status": "ok"}
+
+
+@app.post("/nodes/{node_id}/load", dependencies=[Depends(verify_client_key)])
+def request_node_load(node_id: str):
+    """Kaggle 兩階段啟動的第二階段觸發：/start-node 只開機、回報 GPU 資訊、
+    停在原地等待；管理者確認 GPU 型號/數量滿意後，呼叫這支端點標記
+    「可以開始佈署了」。節點的開機等待迴圈會輪詢 GET /nodes/{id}/load-status
+    讀到這個信號才繼續。Lightning 不使用這個機制（Lightning 啟動時就能明確
+    指定機型，沒有「開機後才知道分配到什麼」的問題，/start-node 一次到位）。"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = get_node_row(conn, node_id)
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="node not found")
+    conn.execute("UPDATE nodes SET load_requested = 1 WHERE node_id = ?", (node_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "load_requested", "node_id": node_id}
+
+
+@app.get("/nodes/{node_id}/load-status")
+def get_node_load_status(node_id: str, x_api_key: str = Header(None)):
+    """給還在「開機等待中」的節點（例如 Kaggle kernel 的第一階段腳本）輪詢用，
+    節點用自己的 NODE_API_KEY 認證，不是管理端的 CLIENT_API_KEY——跟
+    GET /jobs/next 是同一種認證方式。讀到 True 後即清除（一次性通知，
+    語意跟 stop_requested 一致）。"""
+    verify_node_key(node_id, x_api_key)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = get_node_row(conn, node_id)
+    load_requested = bool(row["load_requested"]) if row else False
+    if load_requested:
+        conn.execute("UPDATE nodes SET load_requested = 0 WHERE node_id = ?", (node_id,))
+        conn.commit()
+    conn.close()
+    return {"load_requested": load_requested}
 
 
 @app.get("/nodes", dependencies=[Depends(verify_client_key)])
@@ -554,10 +626,14 @@ def list_nodes():
             "alive": r["last_heartbeat"] > cutoff,
             "last_heartbeat": r["last_heartbeat"],
             "stop_requested": bool(r["stop_requested"]),
+            "status": r["status"] or "running",
+            "started_at": r["started_at"],
             "capability": {
                 "platform": r["platform"],
                 "model": r["current_model"],
                 "vram_gb": r["vram_gb"],
+                "gpu_name": r["gpu_name"],
+                "gpu_count": r["gpu_count"],
             },
         }
         for r in rows

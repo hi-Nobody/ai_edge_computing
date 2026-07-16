@@ -1,5 +1,14 @@
 """
-FinFlow 邊緣節點啟動腳本 v6
+FinFlow 邊緣節點啟動腳本 v7
+
+新增功能（相對 v6）：
+  - detect_vram() 改名/擴充為 detect_gpu_info()，除了 VRAM 總量，也回報
+    GPU 型號名稱與張數（gpu_name／gpu_count），讓 /list-nodes 能直接顯示
+    「這次分配到幾張卡」，不用自己拿 VRAM 數字回推
+  - 每次心跳一併帶上這次 process 的啟動時間（started_at），給
+    /list-nodes 顯示「已運作多久」用
+  - 這兩項都是配合 Kaggle 的兩階段啟動流程新增的：GPU 是隨機分配的，
+    先開機回報硬體規格、確認滿意再真正下載模型，見 DEPLOY.md「Step 5.7」
 
 新增功能（相對 v5）：
   - ensure_ollama() 安裝前先確保 zstd 存在（Kaggle 等平台的基礎映像檔沒有
@@ -36,6 +45,11 @@ import argparse
 import subprocess
 import logging
 import requests
+
+# 這支程式「這次執行」的啟動時間，跟著每次心跳一起送出（見 register_node()），
+# 給 /list-nodes 顯示「運作多久了」用。故意放在最上面、盡量接近真正的 process
+# 起始時刻，不是等到 main() 執行到一半才記錄。
+_PROCESS_START_TIME = time.time()
 
 # ─── 1. 讀取 edge.conf（若存在）───────────────────────────────────────────
 
@@ -136,19 +150,34 @@ logging.basicConfig(
 )
 log = logging.getLogger("finflow-worker")
 
-# ─── 5. VRAM 偵測（失敗回傳 None，維持伺服器端的寬鬆放行邏輯）────────────
+# ─── 5. GPU 資訊偵測（失敗回傳 None/0，維持伺服器端的寬鬆放行邏輯）───────
 
-def detect_vram():
+def detect_gpu_info():
+    """回傳 (vram_gb, gpu_name, gpu_count)，偵測失敗回傳 (None, None, 0)。
+    vram_gb 是所有 GPU 加總（沿用 v5 以前的行為，node_capability_satisfies()
+    的 min_vram_gb 比對邏輯不用跟著改）；gpu_name／gpu_count 是這次新增的，
+    給 /list-nodes 顯示實際分配到的硬體用，尤其是 Kaggle 這種數量隨機分配的
+    平台，開機後可以馬上看到這次到底拿到幾張卡。"""
     try:
         res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
         )
         if res.returncode != 0 or not res.stdout.strip():
-            return None
-        return round(sum(float(x) / 1024 for x in res.stdout.strip().splitlines() if x.strip()), 1)
+            return None, None, 0
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+        names, total_mb = [], 0.0
+        for line in lines:
+            name, mem = line.rsplit(",", 1)
+            names.append(name.strip())
+            total_mb += float(mem.strip())
+        # 保留原本出現順序去重：同型號 GPU 只顯示一次名稱，不同型號混用時
+        # 用 "+" 串起來，讓使用者一眼看出是不是混合配置
+        unique_names = list(dict.fromkeys(names))
+        gpu_name = " + ".join(unique_names)
+        return round(total_mb / 1024, 1), gpu_name, len(lines)
     except Exception:
-        return None
+        return None, None, 0
 
 # ─── 6. Ollama 安裝、模型下載、健康檢查 ────────────────────────────────────
 
@@ -199,7 +228,7 @@ def start_ollama_and_wait(timeout_sec=60):
 
 # ─── 7. 節點註冊（心跳）───────────────────────────────────────────────────
 
-def register_node(vram_gb):
+def register_node(vram_gb, gpu_name=None, gpu_count=0):
     try:
         requests.post(
             f"{CONFIG['ORACLE_URL']}/nodes/heartbeat",
@@ -209,11 +238,16 @@ def register_node(vram_gb):
                 "platform":      PLATFORM,
                 "current_model": CONFIG["MODEL_NAME"],
                 "vram_gb":       vram_gb,
+                "gpu_name":      gpu_name,
+                "gpu_count":     gpu_count,
+                "started_at":    _PROCESS_START_TIME,
+                "status":        "running",
             },
             timeout=10,
             verify=CONFIG["VERIFY_TLS"],
         )
-        log.info(f"節點已向 Oracle 報到：{NODE_ID}｜平台：{PLATFORM}｜模型：{CONFIG['MODEL_NAME']}｜VRAM：{vram_gb}GB")
+        log.info(f"節點已向 Oracle 報到：{NODE_ID}｜平台：{PLATFORM}｜模型：{CONFIG['MODEL_NAME']}｜"
+                 f"GPU：{gpu_name or '未偵測到'} x{gpu_count}｜VRAM：{vram_gb}GB")
     except Exception as e:
         log.warning(f"心跳發送失敗（主迴圈會繼續重試）：{e}")
 
@@ -263,7 +297,7 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 # ─── 9. 主輪詢迴圈（含自動重啟監督）───────────────────────────────────────
 
-def worker_loop(vram_gb):
+def worker_loop(vram_gb, gpu_name=None, gpu_count=0):
     log.info(f"進入主輪詢迴圈（模型：{CONFIG['MODEL_NAME']}）")
     if CONFIG["IDLE_STOP_SEC"] > 0:
         log.info(f"閒置自動停止已啟用：連續 {CONFIG['IDLE_STOP_SEC']} 秒沒有任務就會自動結束節點")
@@ -275,7 +309,7 @@ def worker_loop(vram_gb):
     while True:
         try:
             if loop_count % 15 == 0:
-                register_node(vram_gb)
+                register_node(vram_gb, gpu_name, gpu_count)
 
             res = requests.get(
                 f"{CONFIG['ORACLE_URL']}/jobs/next",
@@ -315,11 +349,11 @@ def worker_loop(vram_gb):
             time.sleep(5)
 
 
-def supervised_loop(vram_gb):
+def supervised_loop(vram_gb, gpu_name=None, gpu_count=0):
     """外層監督：worker_loop 若崩潰，自動重啟，不讓整個 Session 停擺"""
     while True:
         try:
-            worker_loop(vram_gb)
+            worker_loop(vram_gb, gpu_name, gpu_count)
         except Exception as e:
             log.error(f"主迴圈意外終止，10 秒後重啟：{e}")
             time.sleep(10)
@@ -339,8 +373,8 @@ def main():
     start_ollama_and_wait()
     ensure_model(CONFIG["MODEL_NAME"])
 
-    vram_gb = detect_vram()
-    register_node(vram_gb)
+    vram_gb, gpu_name, gpu_count = detect_gpu_info()
+    register_node(vram_gb, gpu_name, gpu_count)
 
     log.info("模型暖機中...")
     try:
@@ -349,7 +383,7 @@ def main():
     except Exception as e:
         log.warning(f"暖機失敗（不影響主流程）：{e}")
 
-    supervised_loop(vram_gb)
+    supervised_loop(vram_gb, gpu_name, gpu_count)
 
 
 if __name__ == "__main__":

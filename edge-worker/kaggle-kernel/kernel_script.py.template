@@ -1,23 +1,131 @@
 """
 Kaggle script 型 kernel 的模板 —— 由 bot-gateway/node_controllers/kaggle.py
-在推送前用 string.Template 把 ${...} 佔位符換成實際值，換完的版本才會被
+在推送前用 string.Template 把 $${...} 佔位符換成實際值，換完的版本才會被
 `kaggle kernels push` 上傳並執行。這份檔案本身不會被直接執行，repo 裡留著
 純粹是方便你看懂 Kaggle 那邊實際跑的內容、以及手動除錯時對照用。
 
-跟你們之前手動操作的差異：
+**兩階段啟動**（這是這份模板存在的主要原因）：Kaggle 官方 API 沒辦法指定
+GPU「數量」（只能用 --accelerator 選型號），同一個 kernel 這次可能分配到
+1 張卡、下次可能 2 張，你沒辦法從程式面強制要求一定要幾張。所以這份腳本
+故意分成兩段：
+
+    第一階段（開機、回報、等待）：
+        - 偵測目前這次 Kaggle session 實際分配到的 GPU 型號/張數
+        - 送一次心跳給 Oracle，status="booting"，讓 /list-nodes 馬上能
+          看到這次到底拿到幾張卡
+        - 進入輪詢迴圈，等 Discord 下 /load-node 之後 Oracle 才會標記
+          load_requested——分配的張數不滿意的話，你可以直接 /stop-node
+          關掉、/start-node 重開，重試看看這次會不會分配到比較多張
+
+    第二階段（真正部署，收到 /load-node 才會執行到這裡）：
+        - 寫 edge.conf、下載 bootstrap.py、裝依賴、前景執行
+
+**注意事項提醒**（跟 Kaggle 平台本身有關，不是這份程式碼的問題）：
+    - 官方頁面（Efficient GPU Usage Tips）說「打開 GPU 加速器的那一刻，
+      session 就開始計費了」，所以**第一階段本身也會消耗你的 Kaggle 週配額**，
+      不是「還沒真的裝 Ollama 所以不算」，只是通常第一階段等待時間短
+      （你看一眼 /list-nodes 就決定關掉重開），單次消耗不多，但重試次數
+      多了還是會累積，不是完全免費的操作
     - 不需要手動 apt-get install zstd（bootstrap.py 的 ensure_ollama() 已經
       會自己處理，見 v6 變更）
-    - 不需要 subprocess.Popen 背景啟動：這裡故意用前景直接執行
-      （最後一行沒有加 & 或用 nohup），因為 Kaggle 判定「這次 run 是否
-      執行完畢」的依據就是「腳本本身有沒有跑完」，前景執行才能讓
-      IDLE_STOP_SEC／遠端停止信號正確對應到「這次 Kaggle session
-      真正結束、GPU 配額被釋放」，不是只有輪詢迴圈自己停了但 session
-      還開著繼續計時
+    - 不需要 subprocess.Popen 背景啟動：兩個階段都故意用前景直接執行，
+      因為 Kaggle 判定「這次 run 是否執行完畢」的依據就是「腳本本身有沒有
+      跑完」，前景執行才能讓 IDLE_STOP_SEC／遠端停止信號正確對應到
+      「這次 Kaggle session 真正結束、GPU 配額被釋放」
 """
 
+import json
 import subprocess
 import sys
+import time
 import urllib.request
+
+import requests
+
+ORACLE_URL = "${ORACLE_URL}"
+NODE_ID = "${NODE_ID}"
+NODE_API_KEY = "${NODE_API_KEY}"
+VERIFY_TLS = "${VERIFY_TLS}".lower() == "true"
+HEADERS = {"x-api-key": NODE_API_KEY, "Content-Type": "application/json"}
+
+if not VERIFY_TLS:
+    requests.packages.urllib3.disable_warnings(
+        requests.packages.urllib3.exceptions.InsecureRequestWarning
+    )
+
+
+def detect_gpu():
+    """回傳 (vram_gb, gpu_name, gpu_count)，偵測失敗回傳 (None, None, 0)。
+    跟 bootstrap.py 的 detect_gpu_info() 邏輯刻意保持一致，但這裡是獨立的
+    一份拷貝——這個階段 bootstrap.py 都還沒下載，沒辦法共用同一份函式。"""
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return None, None, 0
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+        names, total_mb = [], 0.0
+        for line in lines:
+            name, mem = line.rsplit(",", 1)
+            names.append(name.strip())
+            total_mb += float(mem.strip())
+        unique_names = list(dict.fromkeys(names))
+        return round(total_mb / 1024, 1), " + ".join(unique_names), len(lines)
+    except Exception:
+        return None, None, 0
+
+
+def report_booting(vram_gb, gpu_name, gpu_count):
+    try:
+        requests.post(
+            f"{ORACLE_URL}/nodes/heartbeat",
+            headers=HEADERS,
+            json={
+                "node_id": NODE_ID,
+                "platform": "kaggle",
+                "current_model": None,
+                "vram_gb": vram_gb,
+                "gpu_name": gpu_name,
+                "gpu_count": gpu_count,
+                "started_at": time.time(),
+                "status": "booting",
+            },
+            verify=VERIFY_TLS,
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"回報開機狀態失敗（會繼續進入等待迴圈，下面輪詢時還會再送心跳）：{e}")
+
+
+def wait_for_load_signal(poll_interval_sec=5):
+    while True:
+        try:
+            r = requests.get(
+                f"{ORACLE_URL}/nodes/{NODE_ID}/load-status",
+                headers=HEADERS,
+                verify=VERIFY_TLS,
+                timeout=10,
+            )
+            if r.status_code == 200 and r.json().get("load_requested"):
+                return
+        except Exception as e:
+            print(f"輪詢載入信號失敗，{poll_interval_sec} 秒後重試：{e}")
+        time.sleep(poll_interval_sec)
+
+
+# ---------- 第一階段：開機、偵測 GPU、回報、等待 /load-node ----------
+
+vram_gb, gpu_name, gpu_count = detect_gpu()
+print(f"[階段一] 偵測到 GPU：{gpu_name} x{gpu_count}，VRAM 共 {vram_gb}GB")
+report_booting(vram_gb, gpu_name, gpu_count)
+print("[階段一] 已回報開機狀態，等待 Discord /load-node 指令...")
+print("[階段一] 不滿意目前的 GPU 分配數量，可以直接 /stop-node 後 /start-node 重試")
+wait_for_load_signal()
+print("[階段一] 收到載入指令，進入階段二...")
+
+# ---------- 第二階段：真正部署 ----------
 
 EDGE_CONF = """ORACLE_URL=${ORACLE_URL}
 NODE_ID=${NODE_ID}

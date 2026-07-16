@@ -132,6 +132,13 @@ COMMAND_SETS = {
             "options": [_node_id_option()],
         },
         {
+            "name": "load-node",
+            "description": "Kaggle 兩階段啟動專用：確認 GPU 分配滿意後，觸發真正的模型部署",
+            "type": 1,
+            "default_member_permissions": _MANAGE_GUILD_PERMISSION,
+            "options": [_node_id_option()],
+        },
+        {
             "name": "list-nodes",
             "description": "列出所有已設定的節點與目前上線狀態",
             "type": 1,

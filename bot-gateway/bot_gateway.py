@@ -504,6 +504,23 @@ async def _set_oracle_stop_flag(node_id: str) -> bool:
             return False
 
 
+async def _set_oracle_load_flag(node_id: str) -> bool:
+    """呼叫 server.py 的 POST /nodes/{id}/load，標記「可以開始佈署了」。
+    這是 Kaggle 兩階段啟動專用的機制（見 kernel_script.py.template 的
+    說明）：/start-node 只讓節點開機、回報 GPU 硬體資訊，停在原地等這個
+    信號才會真正下載模型。對不支援兩階段啟動的平台（目前是 Lightning），
+    呼叫這支端點不會造成任何影響——反正沒有東西在輪詢這個旗標，單純是
+    server.py 資料庫裡多一筆沒人讀的紀錄，不影響 Lightning 節點本身。"""
+    headers = {"x-api-key": CLIENT_API_KEY, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(f"{ORACLE_INTERNAL_URL}/nodes/{node_id}/load", headers=headers)
+            return resp.status_code == 200
+        except Exception:
+            log.exception("呼叫 Oracle 載入信號端點失敗")
+            return False
+
+
 async def _fetch_live_nodes() -> Optional[List[Dict[str, Any]]]:
     headers = {"x-api-key": CLIENT_API_KEY, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -566,7 +583,44 @@ async def process_start_node(node_id: str, application_id: str, interaction_toke
 
     result = await _run_blocking(controller.start, node_id, full_config)
     prefix = "✅" if result.ok else "❌"
-    await discord_edit_original(application_id, interaction_token, f"{prefix} {result.message}")
+    msg = f"{prefix} {result.message}"
+    if result.ok and platform == "kaggle":
+        msg += ("\n\n這是 Kaggle 的兩階段啟動：節點現在只會開機、偵測這次分配到的 GPU 型號/"
+                "張數，還**不會**下載模型。等一下用 `/list-nodes` 確認 GPU 規格，滿意的話"
+                f"再用 `/load-node node_id:{node_id}` 觸發真正的部署；如果分配到的張數不夠，"
+                f"直接 `/stop-node node_id:{node_id}` 後重新 `/start-node` 即可重試"
+                "（提醒：每次重試本身也會消耗一些 Kaggle GPU 週配額，不是完全免費的操作）。")
+    await discord_edit_original(application_id, interaction_token, msg)
+
+
+async def process_load_node(node_id: str, application_id: str, interaction_token: str):
+    config = node_controllers.get_node_config(node_id)
+    if not config:
+        await discord_edit_original(application_id, interaction_token,
+                                     f"⚠️ 找不到節點 `{node_id}`，請確認 NODE_PLATFORM_MAP 裡有登記。")
+        return
+
+    platform = config.get("platform")
+    if platform != "kaggle":
+        await discord_edit_original(
+            application_id, interaction_token,
+            f"ℹ️ `{node_id}`（{platform}）不使用兩階段啟動，`/start-node` 已經完整部署好了，"
+            f"不需要再下 `/load-node`。",
+        )
+        return
+
+    ok = await _set_oracle_load_flag(node_id)
+    if ok:
+        await discord_edit_original(
+            application_id, interaction_token,
+            f"✅ 已送出載入信號給 `{node_id}`，節點下一次輪詢（通常 5 秒內）就會開始下載模型、"
+            f"啟動 Ollama，過程可能需要幾分鐘，完成後用 `/list-nodes` 確認狀態轉為運作中。",
+        )
+    else:
+        await discord_edit_original(
+            application_id, interaction_token,
+            f"❌ 呼叫 Oracle 載入信號端點失敗，`{node_id}` 會持續停在階段一等待，可以稍後重試這個指令。",
+        )
 
 
 async def process_stop_node(node_id: str, application_id: str, interaction_token: str):
@@ -610,14 +664,29 @@ async def process_list_nodes(application_id: str, interaction_token: str):
     for node_id in all_ids:
         platform = configured.get(node_id, {}).get("platform", "?")
         live_info = live_by_id.get(node_id)
+
         if live_info is None:
-            status = "從未上線"
-        elif live_info["alive"]:
-            model = live_info["capability"].get("model", "?")
-            status = f"🟢 運作中（{model}）"
+            lines.append(f"`{node_id}`（{platform}）：從未上線")
+            continue
+
+        cap = live_info.get("capability", {})
+        gpu_name = cap.get("gpu_name")
+        gpu_count = cap.get("gpu_count")
+        gpu_desc = f"{gpu_name} x{gpu_count}" if gpu_name else "GPU 資訊未知"
+        model = cap.get("model")
+
+        if not live_info["alive"]:
+            status_line = "🔴 離線（曾經上線過）"
+        elif live_info.get("status") == "booting":
+            status_line = f"🟡 開機中，等待 /load-node（{gpu_desc}）"
         else:
-            status = "🔴 離線（曾經上線過）"
-        lines.append(f"`{node_id}`（{platform}）：{status}")
+            uptime = ""
+            if live_info.get("started_at"):
+                uptime_sec = time.time() - live_info["started_at"]
+                uptime = f"，已運作 {round(uptime_sec / 60)} 分鐘"
+            status_line = f"🟢 運作中（模型：{model or '?'}，{gpu_desc}{uptime}）"
+
+        lines.append(f"`{node_id}`（{platform}）：{status_line}")
 
     if live is None:
         lines.append("\n⚠️ 查詢即時心跳狀態失敗，以上只顯示已設定的節點清單，實際狀態未知。")
@@ -670,6 +739,13 @@ async def discord_admin_interactions(
             if not node_id:
                 return {"type": 4, "data": {"content": "⚠️ 缺少 node_id 參數。", "flags": 64}}
             background_tasks.add_task(process_stop_node, node_id, application_id, interaction_token)
+            return {"type": 5}
+
+        if command_name == "load-node":
+            node_id = options.get("node_id")
+            if not node_id:
+                return {"type": 4, "data": {"content": "⚠️ 缺少 node_id 參數。", "flags": 64}}
+            background_tasks.add_task(process_load_node, node_id, application_id, interaction_token)
             return {"type": 5}
 
         if command_name == "list-nodes":
