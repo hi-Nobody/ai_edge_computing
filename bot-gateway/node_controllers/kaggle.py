@@ -153,16 +153,54 @@ class KaggleController(NodeController):
                 # 目前只作為文件記錄用途，不是真的有一個 API 參數在使用它，
                 # 如果之後 kaggle-api 開放這個功能，這裡才會真的接上去。
 
+                accelerator_unsupported = False
+                if (
+                    accelerator
+                    and result.returncode != 0
+                    and "unrecognized arguments" in (result.stderr or "")
+                    and "accelerator" in (result.stderr or "").lower()
+                ):
+                    # 目前安裝的 kaggle CLI 版本不吃 --accelerator 這個參數
+                    # （這個參數的名稱、甚至存不存在，會隨 CLI 版本改變——
+                    # 官方文件跟 changelog 對這個 flag 的寫法本身就不一致，
+                    # 見 KaggleController 檔頭說明）。與其整個失敗，退回成
+                    # 「讓 Kaggle 自動分配」，並在成功訊息裡誠實告知，讓
+                    # 使用者知道這次沒有真的照指定型號拿到節點。
+                    log.warning(
+                        "kaggle CLI 不接受 --accelerator 參數（%s），"
+                        "改用不指定 accelerator 重試一次", result.stderr[-200:]
+                    )
+                    push_cmd = [
+                        _KAGGLE_CLI, "kernels", "push", "-p", str(tmp_path),
+                        "-t", str(KAGGLE_HARD_TIMEOUT_SEC),
+                    ]
+                    result = subprocess.run(
+                        push_cmd, env=_kaggle_env(), capture_output=True,
+                        text=True, timeout=60,
+                    )
+                    accelerator_unsupported = True
+
             if result.returncode != 0:
                 log.error("kaggle kernels push 失敗：%s", result.stderr)
-                return StartResult(False, False, f"Kaggle 啟動失敗（推送 kernel 時出錯）。",
-                                    detail=result.stderr[-500:])
+                stderr_tail = (result.stderr or "").strip()[-300:]
+                return StartResult(
+                    False, False,
+                    f"Kaggle 啟動失敗（推送 kernel 時出錯）：\n```\n{stderr_tail}\n```",
+                    detail=result.stderr[-500:],
+                )
 
-            return StartResult(
-                True, True,
+            msg = (
                 f"已透過 Kaggle API 觸發節點 `{node_id}`（kernel: {KAGGLE_USERNAME}/{kernel_slug}）。"
-                f"開機、裝 Ollama、拉模型可能需要幾分鐘，之後可以用 /list-nodes 確認是否已上線。",
+                f"開機、裝 Ollama、拉模型可能需要幾分鐘，之後可以用 /list-nodes 確認是否已上線。"
             )
+            if accelerator_unsupported:
+                msg += (
+                    f"\n\n⚠️ 目前安裝的 kaggle CLI 版本不接受 `--accelerator` 這個參數，"
+                    f"這次已改成不指定型號、交給 Kaggle 自動分配，**不是**照 `{accelerator}` "
+                    f"拿到節點。想指定型號的話，先跑 `kaggle kernels push -h` 確認這個版本"
+                    f"實際支援的參數名稱，再回報更新 `kaggle.py`。"
+                )
+            return StartResult(True, True, msg)
         except subprocess.TimeoutExpired:
             return StartResult(False, False, "呼叫 Kaggle API 逾時（60 秒內沒有回應），請稍後重試。")
         except Exception as e:
