@@ -18,6 +18,7 @@ Kaggle 節點 controller —— 透過官方 `kaggle` CLI 觸發遠端執行。
 """
 
 import os
+import sys
 import json
 import shutil
 import string
@@ -32,6 +33,16 @@ log = logging.getLogger("node-controllers.kaggle")
 
 KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
 KAGGLE_KEY = os.environ.get("KAGGLE_KEY", "")
+
+# 不要直接用裸指令字串 "kaggle" 交給 subprocess 靠 PATH 去找——bot-gateway.service
+# 是 systemd 服務，繼承的是 systemd 自己的最小化 PATH，不是互動式 shell 那個做過
+# venv activate 調整的 PATH，裸指令字串在服務環境下不保證找得到，即使套件真的
+# 裝在這個 venv 裡也一樣。sys.executable 是目前這個 Python 行程自己的解譯器路徑，
+# 一定就是這個 venv 底下的 python3（因為這支程式本來就在這個 venv 裡執行），
+# 同一個 venv 的 bin/ 目錄下如果有裝 kaggle 套件，kaggle 執行檔一定跟 python3
+# 放在同一層——用這個方式解析出來的絕對路徑，不受 PATH 影響，跟這個專案其他
+# systemd 服務一律用絕對路徑啟動執行檔是同一個原則。
+_KAGGLE_CLI = str(Path(sys.executable).parent / "kaggle")
 
 # repo 裡的模板檔案位置（跟這支程式在同一份 checkout 裡，不需要另外下載）
 _TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "edge-worker" / "kaggle-kernel"
@@ -65,6 +76,14 @@ class KaggleController(NodeController):
     def start(self, node_id: str, node_config: dict) -> StartResult:
         if not KAGGLE_USERNAME or not KAGGLE_KEY:
             return StartResult(False, False, "尚未設定 KAGGLE_USERNAME／KAGGLE_KEY，無法啟動 Kaggle 節點。")
+
+        if not Path(_KAGGLE_CLI).exists():
+            return StartResult(
+                False, False,
+                f"找不到 kaggle CLI（預期路徑：{_KAGGLE_CLI}）。"
+                f"請在 bot-gateway 的 venv 裡執行 `pip install -r requirements.txt`"
+                f"（已包含 kaggle 套件）後重啟 bot-gateway 服務。",
+            )
 
         kernel_slug = node_config.get("kernel_slug")
         if not kernel_slug:
@@ -111,7 +130,7 @@ class KaggleController(NodeController):
                 # IDLE_STOP_SEC、遠端停止信號都沒有正常觸發，Kaggle 官方也會在
                 # 這個時間強制結束，不會無限期燒 GPU 配額。
                 push_cmd = [
-                    "kaggle", "kernels", "push", "-p", str(tmp_path),
+                    _KAGGLE_CLI, "kernels", "push", "-p", str(tmp_path),
                     "-t", str(KAGGLE_HARD_TIMEOUT_SEC),
                 ]
                 accelerator = node_config.get("accelerator")
