@@ -494,22 +494,26 @@ Cloudflare Dashboard → **SSL/TLS** → **Overview**，選 **完整（Full）**
 所有服務會在你沒注意到的情況下突然斷線。「完整」模式明確寫著「不進行憑證驗證，
 接受任何憑證，包括自簽憑證」，是固定、可預期的行為。
 
-**③ `Caddyfile` 加上這個網域名稱**
+**③ 把網域填進 `finflow-queue.env`**
 
-回到 Oracle VM 的 SSH 視窗：
+`Caddyfile` 的站台位址列表已經用 `{$DOMAIN_NAME}` 引用環境變數（跟 `{$ORACLE_PUBLIC_IP}`
+同一套機制），**不需要手動編輯 Caddyfile**，回到 Oracle VM 的 SSH 視窗：
 ```bash
 cd /home/opc/finflow-queue
-nano Caddyfile
+nano finflow-queue.env
 ```
-找到站台位址那一行，在後面加上你的網域（逗號分隔，其他 `handle` 區塊都不用動）：
-```
-127.0.0.1, 10.0.0.152, {$ORACLE_PUBLIC_IP}, <你的網域> {
-```
-存檔後套用：
+找到 `DOMAIN_NAME=` 這一行，填入你的網域後存檔，重啟 caddy 套用：
 ```bash
-sudo caddy validate --config Caddyfile   # 先驗證語法
-sudo cp Caddyfile /etc/caddy/Caddyfile
 sudo systemctl restart caddy
+```
+（`caddy-override.conf` 已經把整份 `finflow-queue.env` 餵給 caddy.service，`DOMAIN_NAME`
+會跟 `ORACLE_PUBLIC_IP` 一樣自動生效，不需要額外設定。）
+
+如果你想在套用前先手動驗證語法，記得同時把兩個變數都帶進去（`caddy validate` 不會
+自動套用 `caddy-override.conf` 的 EnvironmentFile）：
+```bash
+export $(grep -E '^(ORACLE_PUBLIC_IP|DOMAIN_NAME)=' finflow-queue.env)
+sudo -E caddy validate --config Caddyfile
 ```
 
 **④ 驗證**
@@ -524,9 +528,8 @@ https://www.cloudflare.com/ips/ ——這步不急，先確認前面都跑通再
 **`skip_install_trust` 跟 `caddy-override.conf` 都不用因為改用 Cloudflare 而拿掉**：
 前者處理的是 Oracle 端自己簽憑證時裝不進系統信任庫的問題，跟 Cloudflare 完全無關、
 Oracle 端還是繼續用自簽憑證；後者是因為 `Caddyfile` 站台位址列表裡還留著
-`{$ORACLE_PUBLIC_IP}`（保留直連 IP 除錯的能力），只要這個佔位符還在，就還是需要
-`caddy-override.conf` 把環境變數餵給 Caddy。真的確定以後只走 Cloudflare 網域、
-不需要直連 IP 除錯了，才需要把這個佔位符從位址列表移除。
+`{$ORACLE_PUBLIC_IP}`（保留直連 IP 除錯的能力）跟 `{$DOMAIN_NAME}`，只要這兩個
+佔位符還在，就還是需要 `caddy-override.conf` 把環境變數餵給 Caddy。
 
 ---
 
@@ -625,17 +628,20 @@ sudo systemctl status bot-gateway --no-pager -l
 
 確認是 `active (running)` 再往下走。
 
-**6.3.3：註冊 Slash Command（`/ask`）**
+**6.3.3：註冊 Slash Command（`/ask` 與節點群控指令）**
 
 `DISCORD_BOT_TOKEN`／`DISCORD_APPLICATION_ID` 這兩把**不進** `finflow-queue.env`——
 `finflow-queue.env` 是常駐服務（`bot-gateway.service`）執行期間會一直讀取的設定檔，
 但這兩把只有 `register_discord_commands.py` 這支**一次性腳本**用得到，`bot_gateway.py`
-本身處理 Discord 互動時完全不需要 Bot Token（驗證用 `DISCORD_PUBLIC_KEY` 的 Ed25519
-簽章，回覆用 Discord 隨請求夾帶的 interaction token，兩者都跟 Bot Token 無關）。且 Bot
-Token 的權限比 Public Key 大得多（可以讓 bot 發訊息、讀頻道），常態放進常駐服務讀取的
-設定檔，等於讓服務整個執行期間都握著一把用不到、風險卻更高的權限。
+本身處理 Discord 互動時完全不需要 Bot Token（驗證用 `DISCORD_PUBLIC_KEY`／
+`DISCORD_ADMIN_PUBLIC_KEY` 的 Ed25519 簽章，回覆用 Discord 隨請求夾帶的
+`application_id`／interaction token，兩者都跟 Bot Token 無關）。且 Bot Token 的權限
+比 Public Key 大得多（可以讓 bot 發訊息、讀頻道），常態放進常駐服務讀取的設定檔，
+等於讓服務整個執行期間都握著一把用不到、風險卻更高的權限。
 
-改用一個**獨立、不進版本控制**的檔案存放，跟 `register_discord_commands.py`
+`/ask` 跟節點群控（`/start-node` 等）是**兩個不同的 Discord Application（兩個 bot）**，
+要各自去 Developer Portal 建立、各自拿一組 Bot Token／Application ID，不能共用。
+兩組憑證都放進同一個**獨立、不進版本控制**的檔案，跟 `register_discord_commands.py`
 放同一層：
 
 ```bash
@@ -646,11 +652,19 @@ nano discord-admin.env
 內容：
 
 ```bash
+# /ask（一般問答 bot）
 DISCORD_BOT_TOKEN=<6.3.1 的 Bot Token>
 DISCORD_APPLICATION_ID=<6.3.1 的 Application ID>
+
+# 節點群控 bot（另外在 Developer Portal 建立的第二個 Application）
+DISCORD_ADMIN_BOT_TOKEN=<第二個 bot 的 Bot Token>
+DISCORD_ADMIN_APPLICATION_ID=<第二個 bot 的 Application ID>
+
 # 若想先在自己的測試伺服器立即生效，取消下一行的註解（否則 Global Command 最多要等 1 小時）：
 # DISCORD_GUILD_ID=<你的測試伺服器 ID>
 ```
+
+如果目前還沒要做節點群控，`DISCORD_ADMIN_*` 兩行留空即可，不影響 `--set ask` 這組。
 
 **這個檔案千萬不要 `git add`**——確認 repo 的 `.gitignore` 裡有排除
 `bot-gateway/discord-admin.env`（或整條規則 `discord-admin.env`），這份權限比
@@ -658,20 +672,21 @@ DISCORD_APPLICATION_ID=<6.3.1 的 Application ID>
 commit，舊的 commit 紀錄裡還是查得到明碼，唯一補救方法是重寫 git 歷史或整個
 repo 重建，非常麻煩——不要讓它有機會被追蹤到才是根本解法。
 
-準備好之後 `source` 這個檔案、跑註冊腳本：
+準備好之後直接跑註冊腳本，**不需要 `source discord-admin.env`**——腳本會自動讀取
+同一層的 `discord-admin.env`（`--set` 決定要用哪一對憑證，見腳本檔頭說明）：
 
 ```bash
 source venv/bin/activate
-source discord-admin.env
-python3 register_discord_commands.py              # 註冊／更新
-python3 register_discord_commands.py --list         # 查看目前已註冊的指令
-python3 register_discord_commands.py --delete ask   # 刪除指定名稱的指令
+python3 register_discord_commands.py --set ask              # 註冊／更新 /ask
+python3 register_discord_commands.py --set admin            # 註冊／更新節點群控指令
+python3 register_discord_commands.py --set ask --list       # 查看目前已註冊的指令
+python3 register_discord_commands.py --set ask --delete ask # 刪除指定名稱的指令
 ```
 
 看到「註冊/更新成功」就是這步完成了。這不是嚴格意義上的一次性腳本：往後想調整
 指令內容（例如幫 `/ask` 加新參數），直接改 `register_discord_commands.py` 裡的
-`COMMAND_PAYLOAD` 再重新 `source discord-admin.env` 跑一次即可，Discord 會用同名
-指令覆蓋舊定義，不會重複建立。
+`COMMAND_SETS` 再重新跑一次對應的 `--set` 即可，Discord 會用同名指令覆蓋舊定義，
+不會重複建立。
 
 **6.3.4：設定 Interactions Endpoint URL**
 
@@ -1110,12 +1125,15 @@ sudo systemctl status bot-gateway --no-pager -l
 
 ### 7-B.6：註冊管理指令（`/start-node`、`/stop-node`、`/load-node`、`/list-nodes`）
 
+`discord-admin.env` 裡的 `DISCORD_ADMIN_BOT_TOKEN`／`DISCORD_ADMIN_APPLICATION_ID`
+兩行，換成「第二個 bot」（節點群控用，不是 `/ask` 那個）的值（見 6.3.3 的檔案範例）。
+`NODE_PLATFORM_MAP` 不需要手動 `export`，腳本會自動從同一個 repo 根目錄的
+`finflow-queue.env` 讀取（跟你剛剛在 7-B.5 填的是同一份），讓 `node_id` 參數自動
+變成下拉選單：
+
 ```bash
 cd /home/opc/finflow-queue/bot-gateway
 source venv/bin/activate
-source discord-admin.env   # 這裡面要換成「第二個 bot」的 DISCORD_BOT_TOKEN／
-                            # DISCORD_APPLICATION_ID，不是 /ask 那個 bot 的
-export NODE_PLATFORM_MAP='<跟 finflow-queue.env 裡填的一樣，讓 node_id 變成下拉選單>'
 python3 register_discord_commands.py --set admin
 ```
 

@@ -27,6 +27,16 @@ if [ -z "$ORACLE_PUBLIC_IP" ]; then
 fi
 echo "使用的公開 IP：$ORACLE_PUBLIC_IP"
 
+# DOMAIN_NAME 是選填（只有走 Step 4-A Cloudflare 代管憑證才需要），這裡不強制
+# 檢查存在與否——留空是合法狀態（純方案 A 自簽憑證），不應該擋下腳本執行。
+# Caddy 進程本身不需要這裡額外處理：caddy-override.conf 用 EnvironmentFile
+# 載入整份 finflow-queue.env，DOMAIN_NAME 會跟 ORACLE_PUBLIC_IP 一樣自動生效，
+# 這裡讀取單純是為了最後驗證步驟能順手印出對應的 curl 指令。
+DOMAIN_NAME=$(grep -E '^DOMAIN_NAME=' "$ENV_FILE" | cut -d '=' -f2- | tr -d '[:space:]')
+if [ -n "$DOMAIN_NAME" ]; then
+    echo "偵測到網域：$DOMAIN_NAME（已設定 DOMAIN_NAME，稍後會一併印出對應的驗證指令）"
+fi
+
 echo "=== 步驟 1：確認 dnf 環境 ==="
 sudo dnf makecache --quiet
 
@@ -85,3 +95,8 @@ echo ""
 echo "設定完成後執行驗證："
 echo "  curl -k https://127.0.0.1/healthz"
 echo "  curl -k https://$ORACLE_PUBLIC_IP/healthz"
+if [ -n "$DOMAIN_NAME" ]; then
+    echo "  curl https://$DOMAIN_NAME/healthz   # 已設定 DOMAIN_NAME，這行不用加 -k；"
+    echo "                                        # 走 Cloudflare 的話記得先照 DEPLOY.md Step 4-A"
+    echo "                                        # 把橘色雲朵打開、加密模式設成「完整」"
+fi
