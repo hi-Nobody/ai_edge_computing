@@ -563,7 +563,17 @@ async def process_start_node(node_id: str, application_id: str, interaction_toke
     except json.JSONDecodeError:
         keys_map = {}
 
-    oracle_public_host = os.environ.get("ORACLE_PUBLIC_IP", "")
+    # DOMAIN_NAME 優先於 ORACLE_PUBLIC_IP：如果照 DEPLOY.md Step 4-A「⑤」的
+    # 建議收緊了 OCI Security List（只允許 Cloudflare 的 IP 段連進
+    # 443），Kaggle/Colab/Lightning 這些外部節點對 ORACLE_PUBLIC_IP 直連
+    # 會被防火牆直接擋掉（連 TLS 握手都到不了），節點端的心跳／輪詢/停止
+    # 信號全部靜默失敗，症狀是「看起來啟動成功，但永遠查不到硬體規格、
+    # 也永遠關不掉」——因為這兩件事都要靠節點成功連回 Oracle 才做得到。
+    # 有設定 DOMAIN_NAME 就一定要用它（會走 Cloudflare，不受那條防火牆
+    # 規則影響），沒設定才退回直連 IP。
+    domain_name = os.environ.get("DOMAIN_NAME", "").strip()
+    oracle_public_ip = os.environ.get("ORACLE_PUBLIC_IP", "").strip()
+    oracle_public_host = domain_name or oracle_public_ip
     full_config = {
         **config,
         "oracle_url": f"https://{oracle_public_host}" if oracle_public_host else "",
@@ -572,8 +582,9 @@ async def process_start_node(node_id: str, application_id: str, interaction_toke
 
     if not full_config["oracle_url"]:
         await discord_edit_original(application_id, interaction_token,
-                                     "⚠️ finflow-queue.env 裡的 ORACLE_PUBLIC_IP 是空的，"
-                                     "無法組出邊緣節點要連線的網址，請先確認這個值有填。")
+                                     "⚠️ finflow-queue.env 裡的 DOMAIN_NAME、ORACLE_PUBLIC_IP "
+                                     "兩個都是空的，無法組出邊緣節點要連線的網址，"
+                                     "請先確認至少一個有填。")
         return
     if not full_config["node_api_key"]:
         await discord_edit_original(application_id, interaction_token,
