@@ -99,7 +99,22 @@ def report_booting(vram_gb, gpu_name, gpu_count):
         print(f"回報開機狀態失敗（會繼續進入等待迴圈，下面輪詢時還會再送心跳）：{e}")
 
 
-def wait_for_load_signal(poll_interval_sec=5):
+def wait_for_load_signal(vram_gb, gpu_name, gpu_count, poll_interval_sec=5, heartbeat_every_n_polls=6):
+    """等待 /load-node，同時：
+    1. 每隔 heartbeat_every_n_polls 次輪詢（預設 6 次 × 5 秒 = 30 秒）補送一次
+       心跳。Oracle 端 NODE_DEAD_AFTER_SEC 預設 60 秒沒收到心跳就判定節點
+       「離線」，/list-nodes 在離線狀態下不會顯示 GPU 資訊——如果只在剛開機
+       那一刻 report_booting() 一次，管理者猶豫超過一分鐘才看 /list-nodes，
+       節點明明還活著、還在等指令，卻會被誤判成離線、GPU 型號資訊也跟著
+       從畫面上消失，等於整個兩階段設計「先看 GPU 規格再決定」的目的都
+       落空了。定期補心跳讓 alive 狀態在等待期間持續為真。
+    2. 每次輪詢一併檢查 stop_requested：階段一的節點只呼叫這支端點，完全
+       碰不到 /jobs/next，如果不在這裡檢查，/stop-node 在階段一會完全沒
+       有作用，只能乾等 Kaggle 自己的 session 上限（9-12 小時）才會結束，
+       這段等待期間 GPU 配額會持續被消耗。
+    收到 stop_requested 時回傳 False（呼叫端據此結束整支腳本，不進入階段二）；
+    收到 load_requested 時回傳 True。"""
+    poll_count = 0
     while True:
         try:
             r = requests.get(
@@ -108,10 +123,19 @@ def wait_for_load_signal(poll_interval_sec=5):
                 verify=VERIFY_TLS,
                 timeout=10,
             )
-            if r.status_code == 200 and r.json().get("load_requested"):
-                return
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("stop_requested"):
+                    return False
+                if data.get("load_requested"):
+                    return True
         except Exception as e:
             print(f"輪詢載入信號失敗，{poll_interval_sec} 秒後重試：{e}")
+
+        poll_count += 1
+        if poll_count % heartbeat_every_n_polls == 0:
+            report_booting(vram_gb, gpu_name, gpu_count)
+
         time.sleep(poll_interval_sec)
 
 
@@ -122,7 +146,10 @@ print(f"[階段一] 偵測到 GPU：{gpu_name} x{gpu_count}，VRAM 共 {vram_gb}
 report_booting(vram_gb, gpu_name, gpu_count)
 print("[階段一] 已回報開機狀態，等待 Discord /load-node 指令...")
 print("[階段一] 不滿意目前的 GPU 分配數量，可以直接 /stop-node 後 /start-node 重試")
-wait_for_load_signal()
+got_load_signal = wait_for_load_signal(vram_gb, gpu_name, gpu_count)
+if not got_load_signal:
+    print("[階段一] 收到 /stop-node 停止信號，放棄部署、結束腳本（釋放 Kaggle GPU session）")
+    sys.exit(0)
 print("[階段一] 收到載入指令，進入階段二...")
 
 # ---------- 第二階段：真正部署 ----------

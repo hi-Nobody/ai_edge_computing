@@ -596,17 +596,29 @@ def get_node_load_status(node_id: str, x_api_key: str = Header(None)):
     """給還在「開機等待中」的節點（例如 Kaggle kernel 的第一階段腳本）輪詢用，
     節點用自己的 NODE_API_KEY 認證，不是管理端的 CLIENT_API_KEY——跟
     GET /jobs/next 是同一種認證方式。讀到 True 後即清除（一次性通知，
-    語意跟 stop_requested 一致）。"""
+    語意跟 stop_requested 一致）。
+
+    一併回傳並消費 stop_requested：階段一（等待 /load-node）的節點只會呼叫
+    這支端點，完全不會碰到 /jobs/next，所以如果 stop_requested 只在
+    /jobs/next 才會被讀到，管理者在階段一下的 /stop-node 會被晾在那裡，
+    節點要一路等到（如果有）真正進入階段二才看得到——對 Kaggle 沒有官方
+    停止 API 的情況來說，這會讓「階段一就想放棄重試」變成做不到的事。
+    這裡讓兩個輪詢端點都能讀到、清除同一個 stop_requested 旗標，哪個先
+    輪詢到就算數，語意上跟 load_requested 的一次性通知一致。"""
     verify_node_key(node_id, x_api_key)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = get_node_row(conn, node_id)
     load_requested = bool(row["load_requested"]) if row else False
-    if load_requested:
-        conn.execute("UPDATE nodes SET load_requested = 0 WHERE node_id = ?", (node_id,))
+    stop_requested = bool(row["stop_requested"]) if row else False
+    if load_requested or stop_requested:
+        conn.execute(
+            "UPDATE nodes SET load_requested = 0, stop_requested = 0 WHERE node_id = ?",
+            (node_id,),
+        )
         conn.commit()
     conn.close()
-    return {"load_requested": load_requested}
+    return {"load_requested": load_requested, "stop_requested": stop_requested}
 
 
 @app.get("/nodes", dependencies=[Depends(verify_client_key)])

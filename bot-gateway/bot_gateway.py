@@ -676,7 +676,11 @@ async def process_list_nodes(application_id: str, interaction_token: str):
         model = cap.get("model")
 
         if not live_info["alive"]:
-            status_line = "🔴 離線（曾經上線過）"
+            # 離線也一併顯示最後一次心跳回報的 GPU 資訊（不是「現在還占用」，
+            # 是「上次活著的時候拿到的規格」，方便判斷值不值得重開）；
+            # gpu_name 為 None 時（例如從未成功偵測到 GPU）才顯示「GPU 資訊未知」
+            last_known = f"，最後已知 {gpu_desc}" if gpu_name else ""
+            status_line = f"🔴 離線（曾經上線過{last_known}）"
         elif live_info.get("status") == "booting":
             status_line = f"🟡 開機中，等待 /load-node（{gpu_desc}）"
         else:
