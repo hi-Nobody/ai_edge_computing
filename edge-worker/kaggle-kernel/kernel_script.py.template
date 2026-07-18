@@ -78,8 +78,16 @@ def detect_gpu():
 
 
 def report_booting(vram_gb, gpu_name, gpu_count):
+    """`requests.post()` 對 HTTP 4xx/5xx **不會**主動丟例外（只有連線層級的
+    問題，例如逾時、DNS 失敗、TLS 握手失敗才會）——如果不手動檢查
+    `status_code`，Oracle 端回 401（NODE_API_KEY 對不上）、404、500 這些
+    情況全部會被下面的 `except Exception` 直接放過，腳本會照樣印出
+    「已回報開機狀態」，實際上這筆心跳可能根本沒有被 Oracle 接受、沒有
+    寫進資料庫，卻完全看不出任何異狀，只能眼睜睜看著 `/list-nodes`
+    永遠查不到資料、卻不知道問題出在哪。這裡明確檢查狀態碼、印出對應
+    的診斷內容，錯誤才會確實出現在 Kaggle 的 Logs 分頁裡。"""
     try:
-        requests.post(
+        resp = requests.post(
             f"{ORACLE_URL}/nodes/heartbeat",
             headers=HEADERS,
             json={
@@ -95,8 +103,16 @@ def report_booting(vram_gb, gpu_name, gpu_count):
             verify=VERIFY_TLS,
             timeout=10,
         )
+        if resp.status_code == 200:
+            print("[心跳] 回報開機狀態成功")
+        else:
+            print(f"[心跳] 回報開機狀態被 Oracle 拒絕：HTTP {resp.status_code}，"
+                  f"回應內容：{resp.text[:300]}"
+                  "（常見原因：NODE_API_KEY 對不上，檢查 finflow-queue.env 的 "
+                  "NODE_API_KEYS_JSON 跟這次推送用的是否一致；會繼續進入等待"
+                  "迴圈，下面輪詢時還會再送心跳）")
     except Exception as e:
-        print(f"回報開機狀態失敗（會繼續進入等待迴圈，下面輪詢時還會再送心跳）：{e}")
+        print(f"[心跳] 回報開機狀態時連線失敗（會繼續進入等待迴圈，下面輪詢時還會再送心跳）：{e}")
 
 
 def wait_for_load_signal(vram_gb, gpu_name, gpu_count, poll_interval_sec=5, heartbeat_every_n_polls=6):
@@ -129,6 +145,12 @@ def wait_for_load_signal(vram_gb, gpu_name, gpu_count, poll_interval_sec=5, hear
                     return False
                 if data.get("load_requested"):
                     return True
+            else:
+                # 同樣是「HTTP 錯誤不會讓 requests 丟例外」這個坑（見
+                # report_booting() 的說明）——不檢查就會永遠卡在等待迴圈，
+                # 卻連一行錯誤訊息都不會印出來
+                print(f"[輪詢] /load-status 被 Oracle 拒絕：HTTP {r.status_code}，"
+                      f"回應內容：{r.text[:300]}")
         except Exception as e:
             print(f"輪詢載入信號失敗，{poll_interval_sec} 秒後重試：{e}")
 
@@ -144,7 +166,8 @@ def wait_for_load_signal(vram_gb, gpu_name, gpu_count, poll_interval_sec=5, hear
 vram_gb, gpu_name, gpu_count = detect_gpu()
 print(f"[階段一] 偵測到 GPU：{gpu_name} x{gpu_count}，VRAM 共 {vram_gb}GB")
 report_booting(vram_gb, gpu_name, gpu_count)
-print("[階段一] 已回報開機狀態，等待 Discord /load-node 指令...")
+print("[階段一] 開機回報已送出（實際是否成功見上一行），進入等待迴圈，"
+      "等 Discord /load-node 指令...")
 print("[階段一] 不滿意目前的 GPU 分配數量，可以直接 /stop-node 後 /start-node 重試")
 got_load_signal = wait_for_load_signal(vram_gb, gpu_name, gpu_count)
 if not got_load_signal:
