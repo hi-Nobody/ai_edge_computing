@@ -314,25 +314,40 @@ def register_node(vram_gb, gpu_name=None, gpu_count=0, status="running"):
         log.info(f"節點已向 Oracle 報到：{NODE_ID}｜狀態：{status}｜平台：{PLATFORM}｜模型：{CONFIG['MODEL_NAME']}｜"
                  f"GPU：{gpu_name or '未偵測到'} x{gpu_count}｜VRAM：{vram_gb}GB")
     except Exception as e:
-        log.warning(f"心跳發送失敗（主迴圈會繼續重試）：{e}")
+        log.warning(f"心跳發送失敗（背景心跳執行緒會在下一次 interval 自動重試）：{e}")
 
 
 import threading
 
-def _loading_heartbeat_loop(stop_event, vram_gb, gpu_name, gpu_count, interval_sec=25):
-    """`ensure_ollama()`／`ensure_model()` 這段是同步阻塞呼叫，中間沒有任何
-    機會送心跳——`ensure_model()` 拉一個 9B/14B 模型視情況要好幾分鐘，遠遠
-    超過 Oracle 端 NODE_DEAD_AFTER_SEC（60 秒）的判定門檻，導致節點明明還
-    活著（正在下載），`/list-nodes` 卻顯示離線，等下載完成才會忽然跳成
-    運作中，順序完全不符合直覺，也讓人誤以為節點中途斷過線。這裡用背景
-    執行緒每 25 秒補送一次心跳（status 設成 "loading"，不是 "running"，
-    這樣 /list-nodes 才能正確顯示成「下載中」而不是誤報成「已經 ready」），
-    在 main() 呼叫 register_node() 送出真正的 "running" 心跳之前，讓 Oracle
-    持續知道節點還活著。用 threading.Event().wait() 而不是 time.sleep()：
-    stop_event.set() 之後能立即結束，不用多等到下一次 interval_sec 才發現
-    該停了。"""
+# 目前要回報的狀態，背景心跳執行緒每次醒來就送這個值。用一個 dict 包著（不是
+# 裸的模組層級字串）是刻意的：多執行緒共用可變狀態時，比起裸變數搭配
+# `global` 關鍵字，這樣寫更不容易在之後維護時漏加 `global` 卻沒發現
+# （忘記加只是讀取的話沒事，忘記加又想寫入會在函式內產生一個沒人看得到的
+# 區域變數，錯誤模式很隱晦）。CPython 的 GIL 讓 dict 的單一 key 存取本身
+# 是安全的，這種簡單場景不需要額外上鎖。
+_node_state = {"status": "loading"}
+
+def _heartbeat_daemon(stop_event, vram_gb, gpu_name, gpu_count, interval_sec=20):
+    """整個節點生命週期唯一的心跳來源，從 main() 一開始（GPU 偵測完就啟動）
+    到 shutdown() 為止都在跑，不因為主執行緒在忙什麼而停擺：
+
+    - `ensure_ollama()`／`ensure_model()`（下載模型，可能數分鐘）跟暖機
+      （實測可能上百秒）都是同步阻塞呼叫，這段時間主執行緒完全無法自己
+      送心跳（這是 v28 修過的部分）。
+    - `worker_loop()` 領到任務後呼叫 `run_inference()` 一樣是同步阻塞，
+      推論花多久主執行緒就卡多久（這是這次新發現、v29 之後才抓到的部分：
+      實測一次 38 秒的推論，加上它剛好卡在心跳週期中段，兩者疊加造成
+      將近 70 秒的空窗，超過 Oracle 端 60 秒的離線判定門檻）。
+
+    與其針對「哪個步驟可能卡住」逐一補心跳（前後已經補了兩次，每次都只
+    堵住當時發現的那個洞、下一個阻塞點還是會重演一樣的問題），這裡改成
+    背景執行緒整條生命週期只啟動一次，不管主執行緒卡在哪一步都不受影響，
+    一次把這一整類問題解決掉，不用每發現一個新的阻塞點就再补一次。
+    `interval_sec` 從 25 秒收緊到 20 秒，是為了在 `NODE_DEAD_AFTER_SEC`
+    （60 秒）門檻前多留一點緩衝，即使單次心跳因為網路狀況遲到或失敗一次，
+    下一次還來得及在門檻前補上。"""
     while not stop_event.wait(interval_sec):
-        register_node(vram_gb, gpu_name, gpu_count, status="loading")
+        register_node(vram_gb, gpu_name, gpu_count, status=_node_state["status"])
 
 # ─── 8. 推論與任務回報 ──────────────────────────────────────────────────────
 
@@ -387,12 +402,17 @@ def worker_loop(vram_gb, gpu_name=None, gpu_count=0):
     else:
         log.info("閒置自動停止已停用（IDLE_STOP_SEC <= 0），節點會持續運行")
 
-    loop_count = 0
     last_activity_at = time.time()  # 一開始就算「活躍」，避免節點剛啟動就被判定閒置
     while True:
         try:
-            if loop_count % 15 == 0:
-                register_node(vram_gb, gpu_name, gpu_count)
+            # 心跳交給貫穿全生命週期的背景執行緒（_heartbeat_daemon）統一
+            # 負責，這裡不再自己送——這裡以前是 `if loop_count % 15 == 0:
+            # register_node(...)`，問題是這個檢查只會在迴圈跑到下一輪時才
+            # 觸發，但 run_inference() 是同步阻塞呼叫，推論花多久這裡就卡
+            # 多久，卡住的時候永遠不會執行到這一行，實測一次 38 秒的推論
+            # 就足以錯過好幾輪檢查、湊出超過 60 秒的心跳空窗，導致節點
+            # 明明在正常工作、卻被 Oracle 判定離線。背景執行緒不受這個迴圈
+            # 卡不卡住影響，才是真正解法。
 
             res = requests.get(
                 f"{CONFIG['ORACLE_URL']}/jobs/next",
@@ -424,7 +444,6 @@ def worker_loop(vram_gb, gpu_name=None, gpu_count=0):
                 idle_min = round((time.time() - last_activity_at) / 60, 1)
                 shutdown(f"已閒置 {idle_min} 分鐘（超過 {CONFIG['IDLE_STOP_SEC']} 秒門檻），自動停止以節省 GPU 配額")
 
-            loop_count += 1
             time.sleep(2)
 
         except Exception as e:
@@ -456,37 +475,35 @@ def main():
     # 資訊送出心跳，不用等 ensure_ollama／ensure_model 跑完才知道
     vram_gb, gpu_name, gpu_count = detect_gpu_info()
 
-    stop_loading_heartbeat = threading.Event()
-    loading_heartbeat_thread = threading.Thread(
-        target=_loading_heartbeat_loop,
-        args=(stop_loading_heartbeat, vram_gb, gpu_name, gpu_count),
-        daemon=True,  # daemon=True：main process 结束時這條背景執行緒不會
-                      # 卡著不放，不需要額外處理它的收尾
+    # 貫穿整個生命週期的唯一心跳來源，從這裡啟動、到 shutdown() 為止都在跑
+    # （daemon=True：process 結束時這條背景執行緒不需要額外收尾）。
+    # _node_state["status"] 預設就是 "loading"（模組層級初始值），不用在這裡
+    # 再設一次
+    stop_heartbeat = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_daemon,
+        args=(stop_heartbeat, vram_gb, gpu_name, gpu_count),
+        daemon=True,
     )
-    loading_heartbeat_thread.start()
+    heartbeat_thread.start()
+
+    ensure_ollama()
+    start_ollama_and_wait()
+    ensure_model(CONFIG["MODEL_NAME"])
+
+    log.info("模型暖機中...")
     try:
-        ensure_ollama()
-        start_ollama_and_wait()
-        ensure_model(CONFIG["MODEL_NAME"])
+        run_inference([{"role": "user", "content": "hi"}])
+        log.info("模型暖機完成")
+    except Exception as e:
+        log.warning(f"暖機失敗（不影響主流程）：{e}")
 
-        # 暖機（跑一次真正的推論觸發模型載入進 VRAM）實測可能花到 100 秒
-        # 以上，一樣遠超過 60 秒的離線判定門檻，所以背景心跳要蓋到這裡
-        # 結束為止，不能在暖機開始前就提早停掉、送出 "running"——那樣
-        # 暖機這段又會重演一次一模一樣的問題，只是空窗從「下載模型」
-        # 搬到「暖機」而已。
-        log.info("模型暖機中...")
-        try:
-            run_inference([{"role": "user", "content": "hi"}])
-            log.info("模型暖機完成")
-        except Exception as e:
-            log.warning(f"暖機失敗（不影響主流程）：{e}")
-    finally:
-        # 不管上面成功或丟例外，都要停止背景心跳——如果中途失敗，讓
-        # worker_loop／supervised_loop 外層的重試機制接手，不要讓一個
-        # 「一直送 loading 心跳、卻再也不會變成 running」的殭屍狀態留著
-        stop_loading_heartbeat.set()
-
+    # 切到 running 狀態：背景心跳執行緒下一次醒來就會用這個新狀態送心跳；
+    # 這裡額外主動送一次，是為了讓 /list-nodes 立刻反映「已經 ready」，
+    # 不用多等到下一次 interval_sec（20 秒）才更新
+    _node_state["status"] = "running"
     register_node(vram_gb, gpu_name, gpu_count, status="running")
+
     supervised_loop(vram_gb, gpu_name, gpu_count)
 
 
