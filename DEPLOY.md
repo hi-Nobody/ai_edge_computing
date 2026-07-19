@@ -1,6 +1,6 @@
-# FinFlow 分散式邊緣運算系統部署指南（v25，修正 Kaggle kernel 端心跳/輪詢請求的錯誤被靜默吞掉的問題）
+# FinFlow 分散式邊緣運算系統部署指南（v26，補上 Lightning 節點指定 GPU 型號的支援）
 
-> **v25** 內容變更摘要見文末「變更紀錄摘要」的 v25 小節；編號規則沿用 v22（見下方
+> **v26** 內容變更摘要見文末「變更紀錄摘要」的 v26 小節；編號規則沿用 v22（見下方
 > 說明未變動）。
 
 > 本輪（v22）**只調整文件的編號與章節結構，沒有修改任何指令、程式碼或設定值**。
@@ -1290,6 +1290,27 @@ sudo systemctl status bot-gateway --no-pager -l
 Studio」，不是「建立一個新的」）。第一次使用前，先手動到 Lightning 網頁建立一次，
 之後靠 `/start-node`／`/stop-node` 遠端開關就好，不需要每次都重建。
 
+**怎麼找 `teamspace` 的值**：登入 `lightning.ai`，點進任一個 Studio，看瀏覽器
+網址列，格式是 `lightning.ai/<帳號或組織>/<teamspace>/studios/<studio 名稱>`，
+中間那段就是要填的值——**是網址列的 slug，不是畫面上顯示的標題**（兩者有時會
+有些微差異，例如空格變成連字號）。免費個人帳號如果沒手動建過 teamspace，
+Lightning 通常會自動給一個個人預設 teamspace，一樣照這個方式從網址列確認。
+
+**可以指定 GPU 型號（`machine` 欄位，v26 起支援）**：`lightning_sdk` 官方
+支援 `studio.start(Machine.T4)` 這種寫法，在 `NODE_PLATFORM_MAP` 裡加一個
+`"machine"` 欄位即可（大小寫不拘，內部會轉大寫比對），例如：
+
+```
+NODE_PLATFORM_MAP={"kaggle-1":{...},"lightning-1":{"platform":"lightning","studio_name":"finflow-edge-1","teamspace":"<你的 teamspace 名稱>","machine":"T4"}}
+```
+
+已知的機型值包含 `CPU`、`T4`、`A10G`、`L4` 等（實際可用選項以你安裝的
+`lightning_sdk` 版本的 `Machine` enum 為準，`lightning.py` 給的值不對時，
+`/start-node` 的錯誤訊息會直接列出當下這個版本所有已知的合法選項）。不填
+`machine` 就維持原本行為——沿用這個 Studio 上次用過的機型，不會強制切換。
+跟 Kaggle 不同，Lightning 是持久 VM，選好機型之後除非你自己改，不會每次
+`/start-node` 都隨機分配。
+
 ### 7-B.9：實測
 
 在管理伺服器裡，Kaggle 節點是兩階段流程：
@@ -1408,6 +1429,19 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v26（本次）
+
+補上 Lightning 節點指定 GPU 型號的支援。`lightning_sdk` 官方本來就支援
+`studio.start(Machine.T4)` 這種寫法，但 `lightning.py` 原本呼叫
+`studio.start()` 完全沒帶參數，等於 Lightning 節點的機型完全交給 Studio
+「上次用過的」決定，`NODE_PLATFORM_MAP` 沒有任何欄位能控制——這跟 Kaggle
+那邊已經支援的 `accelerator` 欄位比起來，是明顯少掉的一塊功能，這次補齊。
+
+| 檔案 | 變更 |
+|------|------|
+| `bot-gateway/node_controllers/lightning.py` | 新增 `_resolve_machine()`，從 `NODE_PLATFORM_MAP` 讀取 `machine` 欄位（大小寫不拘），轉成 `lightning_sdk.Machine` 對應成員；`start()` 改成有指定就 `studio.start(machine)`、沒指定維持原本 `studio.start()` 的預設行為；值不對時的錯誤訊息會列出當下版本所有已知合法選項，不用去翻 SDK 原始碼才知道能填什麼 |
+| `DEPLOY.md`（本檔） | Step 7-B.8 補上 `machine` 欄位說明與範例，並補充「怎麼從網址列找 `teamspace` 值」（這是本來就該寫但漏掉的內容，不是這次程式碼變動附帶的） |
 
 ### v25（本次）
 

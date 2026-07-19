@@ -65,6 +65,24 @@ class LightningController(NodeController):
             user=node_config.get("lightning_user", LIGHTNING_USER_ID),
         )
 
+    def _resolve_machine(self, node_config: dict):
+        """把 NODE_PLATFORM_MAP 裡的 "machine" 字串（例如 "T4"）轉成
+        lightning_sdk.Machine 的對應成員。不設定就回傳 None，讓
+        studio.start() 用預設行為（沿用這個 Studio 上次的機型）。
+        字串刻意做大寫比對，這樣設定檔裡寫 "t4" 或 "T4" 都能吃。"""
+        machine_str = node_config.get("machine")
+        if not machine_str:
+            return None
+        from lightning_sdk import Machine
+        candidate = machine_str.strip().upper()
+        if hasattr(Machine, candidate):
+            return getattr(Machine, candidate)
+        valid = [name for name in dir(Machine) if not name.startswith("_")]
+        raise ValueError(
+            f"machine 設定值 {machine_str!r} 不是有效的 Lightning 機型，"
+            f"目前 lightning_sdk 版本已知的選項：{', '.join(valid)}"
+        )
+
     def start(self, node_id: str, node_config: dict) -> StartResult:
         if not LIGHTNING_USER_ID or not LIGHTNING_API_KEY:
             return StartResult(False, False, "尚未設定 LIGHTNING_USER_ID／LIGHTNING_API_KEY，無法啟動 Lightning 節點。")
@@ -72,14 +90,23 @@ class LightningController(NodeController):
             return StartResult(False, False, f"NODE_PLATFORM_MAP 裡 {node_id} 缺少 studio_name／teamspace。")
 
         try:
+            machine = self._resolve_machine(node_config)
+        except ValueError as e:
+            return StartResult(False, False, str(e))
+
+        try:
             studio = self._get_studio(node_config)
-            studio.start()
+            if machine is not None:
+                studio.start(machine)
+            else:
+                studio.start()
             command = _build_start_command(node_id, node_config)
             studio.run(command)
+            machine_desc = f"，機型 `{node_config['machine']}`" if machine is not None else "（沿用這個 Studio 目前/上次的機型，未在設定裡指定）"
             return StartResult(
                 True, True,
-                f"已呼叫 Lightning API 啟動 Studio `{node_config['studio_name']}`（節點 `{node_id}`），"
-                f"並在裡面背景啟動 bootstrap.py。第一次啟動需要下載 Ollama／模型可能較久，"
+                f"已呼叫 Lightning API 啟動 Studio `{node_config['studio_name']}`（節點 `{node_id}`）"
+                f"{machine_desc}，並在裡面背景啟動 bootstrap.py。第一次啟動需要下載 Ollama／模型可能較久，"
                 f"之後重開會快很多（Studio 硬碟是持久的）。",
             )
         except Exception as e:
