@@ -1,0 +1,22 @@
+# 機敏設定檔（含明碼金鑰/token，絕對不能進版本控制）
+finflow-queue.env
+bot-gateway/discord-admin.env
+edge-worker/edge.conf
+!edge-worker/edge.conf.example
+
+# 資料庫、log
+*.db
+*.db-journal
+*.log
+worker.log
+vllm_server.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 部署過程中在 Oracle 本機產生、不屬於 repo 內容的檔案
+/etc/caddy/Caddyfile
+kaggle.json

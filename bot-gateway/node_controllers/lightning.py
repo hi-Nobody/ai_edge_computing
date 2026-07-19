@@ -17,7 +17,7 @@ Kaggle 那種「每次執行都是全新容器」的批次模型，所以：
 import os
 import logging
 
-from .base import NodeController, StartResult, StopResult
+from .base import NodeController, StartResult, StopResult, load_node_conf, NodeConfError
 
 log = logging.getLogger("node-controllers.lightning")
 
@@ -30,20 +30,20 @@ BOOTSTRAP_RAW_URL = os.environ.get(
 )
 
 
-def _build_start_command(node_id: str, node_config: dict) -> str:
+def _build_start_command(node_id: str, node_conf: dict) -> str:
     """組出在 Studio 裡執行的一行指令：寫 edge.conf、更新 bootstrap.py、
     背景啟動。跟 Kaggle 版模板做同樣的事，但因為 Lightning 是持久 VM，
     ollama 安裝與模型下載交給 bootstrap.py 自己的 ensure_ollama()／
-    ensure_model() 判斷是否已存在，不會重複下載。"""
-    edge_conf = "\\n".join([
-        f"ORACLE_URL={node_config['oracle_url']}",
-        f"NODE_ID={node_id}",
-        f"NODE_API_KEY={node_config['node_api_key']}",
-        f"MODEL_NAME={node_config.get('model_name', 'qwen2.5-coder:14b')}",
-        f"VERIFY_TLS={node_config.get('verify_tls', 'false')}",
-        f"INFERENCE_TIMEOUT_SEC={node_config.get('inference_timeout_sec', 300)}",
-        f"IDLE_STOP_SEC={node_config.get('idle_stop_sec', 1800)}",
-    ])
+    ensure_model() 判斷是否已存在，不會重複下載。
+
+    node_conf 是 base.load_node_conf() 讀出來的 edge-worker/edge.conf
+    裡對應 [node_id] 區塊的內容，直接整段原樣寫出去（不逐欄位挑著填），
+    這樣以後 edge.conf 格式多了新欄位不用跟著改這裡，寫到 Studio 上的
+    這份 edge.conf 是單一節點的平鋪格式（沒有 [區塊]），bootstrap.py
+    讀到沒有 [區塊] 的檔案時會直接當整份都是這個節點的設定，行為完全
+    相容。"""
+    edge_conf_lines = [f"{k}={v}" for k, v in node_conf.items() if not k.startswith("_")]
+    edge_conf = "\\n".join(edge_conf_lines)
     return (
         f"mkdir -p ~/finflow-edge && cd ~/finflow-edge && "
         f"printf '{edge_conf}\\n' > edge.conf && "
@@ -94,20 +94,35 @@ class LightningController(NodeController):
         except ValueError as e:
             return StartResult(False, False, str(e))
 
+        # 節點的身分／模型／連線資訊一律從 edge-worker/edge.conf 的
+        # [node_id] 區塊讀，不再由 bot_gateway.py 動態組裝——理由跟
+        # kaggle.py 一致，見 base.load_node_conf() 的說明。machine（GPU
+        # 型號）維持從 NODE_PLATFORM_MAP 讀，那是「怎麼呼叫 Lightning API」
+        # 的平台專屬設定，跟節點自己的身分／模型設定是不同層級的東西。
+        try:
+            node_conf = load_node_conf(node_id)
+        except NodeConfError as e:
+            return StartResult(False, False, str(e))
+        warning_suffix = ""
+        if node_conf["_warnings"]:
+            warning_suffix = "\n\n⚠️ 以下欄位使用了預設值，不是你以為的設定：\n- " + \
+                              "\n- ".join(node_conf["_warnings"])
+
         try:
             studio = self._get_studio(node_config)
             if machine is not None:
                 studio.start(machine)
             else:
                 studio.start()
-            command = _build_start_command(node_id, node_config)
+            command = _build_start_command(node_id, node_conf)
             studio.run(command)
             machine_desc = f"，機型 `{node_config['machine']}`" if machine is not None else "（沿用這個 Studio 目前/上次的機型，未在設定裡指定）"
             return StartResult(
                 True, True,
-                f"已呼叫 Lightning API 啟動 Studio `{node_config['studio_name']}`（節點 `{node_id}`）"
+                f"已呼叫 Lightning API 啟動 Studio `{node_config['studio_name']}`（節點 `{node_id}`，"
+                f"模型：{node_conf['MODEL_NAME']}）"
                 f"{machine_desc}，並在裡面背景啟動 bootstrap.py。第一次啟動需要下載 Ollama／模型可能較久，"
-                f"之後重開會快很多（Studio 硬碟是持久的）。",
+                f"之後重開會快很多（Studio 硬碟是持久的）。" + warning_suffix,
             )
         except Exception as e:
             log.exception("Lightning 節點啟動時發生例外")

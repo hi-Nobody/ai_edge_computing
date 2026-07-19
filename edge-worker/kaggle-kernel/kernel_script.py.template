@@ -177,13 +177,12 @@ print("[階段一] 收到載入指令，進入階段二...")
 
 # ---------- 第二階段：真正部署 ----------
 
-EDGE_CONF = """ORACLE_URL=${ORACLE_URL}
-NODE_ID=${NODE_ID}
-NODE_API_KEY=${NODE_API_KEY}
-MODEL_NAME=${MODEL_NAME}
-VERIFY_TLS=${VERIFY_TLS}
-INFERENCE_TIMEOUT_SEC=${INFERENCE_TIMEOUT_SEC}
-IDLE_STOP_SEC=${IDLE_STOP_SEC}
+# EDGE_CONF_BODY 是 Oracle 端 edge-worker/edge.conf 裡 [${NODE_ID}] 這個區塊
+# 的原始內容（去除註解/空行後）整段
+# 帶過來的，不是逐欄位挑著填——這樣 edge.conf 格式以後多了新欄位（例如 v6
+# 的 INFERENCE_ENGINE／VLLM_*），這裡完全不用跟著改，兩條啟動路徑（手動貼上
+# 執行 vs Discord 觸發）保證讀到一模一樣的設定內容。
+EDGE_CONF = """${EDGE_CONF_BODY}
 """
 
 with open("edge.conf", "w", encoding="utf-8") as f:

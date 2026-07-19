@@ -1,6 +1,6 @@
-# FinFlow 分散式邊緣運算系統部署指南（v26，補上 Lightning 節點指定 GPU 型號的支援）
+# FinFlow 分散式邊緣運算系統部署指南（v27，節點設定改為單一事實來源 edge.conf，用 [node_id] 分區塊管理多節點）
 
-> **v26** 內容變更摘要見文末「變更紀錄摘要」的 v26 小節；編號規則沿用 v22（見下方
+> **v27** 內容變更摘要見文末「變更紀錄摘要」的 v27 小節；編號規則沿用 v22（見下方
 > 說明未變動）。
 
 > 本輪（v22）**只調整文件的編號與章節結構，沒有修改任何指令、程式碼或設定值**。
@@ -1193,6 +1193,69 @@ python3 register_discord_commands.py --set admin
 管理指令預設加了 `default_member_permissions`（需要 Manage Server 權限），
 一般成員即使在同一個頻道也看不到這三個指令，不需要額外設定頻道權限。
 
+### 7-B.6.5：`edge-worker/edge.conf` 集中管理所有節點的設定
+
+`NODE_PLATFORM_MAP` 只保留「怎麼呼叫這個平台的 API」需要的欄位（`kernel_slug`／
+`accelerator`、`studio_name`／`teamspace`／`machine`）——節點自己的身分
+（`NODE_API_KEY`）、要跑哪個模型（`MODEL_NAME`）、連線設定（`ORACLE_URL`、
+`VERIFY_TLS`、`INFERENCE_TIMEOUT_SEC`、`IDLE_STOP_SEC`），全部集中放進同一份
+`edge-worker/edge.conf`，用 `[node_id]` 區塊分隔每個節點。**這是刻意的設計**：
+不管你是手動操作還是用 `/start-node` 遠端觸發，讀的都是同一份檔案，不會有
+「VPS 端記的預設值」跟「你以為節點在用的設定」兜不起來的情況；節點數變多時
+只要在這份檔案裡加一個新區塊，不需要每加一個節點就多開一個檔案。
+
+```bash
+cd /home/opc/finflow-queue/edge-worker
+cp edge.conf.example edge.conf
+nano edge.conf
+```
+
+格式說明（也可以直接參考 `edge.conf.example` 裡的註解）：
+- 第一個 `[node_id]` 區塊**之前**的 `KEY=VALUE`，是所有節點共用的預設值——
+  多數情況下 `ORACLE_URL`、`VERIFY_TLS` 每個節點都一樣，寫一次就好
+- 個別節點需要不同設定時，在自己的 `[node_id]` 區塊裡寫同名 `KEY` 覆蓋
+  繼承來的預設值即可（例如某個節點想跑不同模型，直接在它的區塊裡寫
+  `MODEL_NAME=xxx`）
+- `NODE_API_KEY` 填成跟 `finflow-queue.env` 的 `NODE_API_KEYS_JSON` 裡對應
+  這個 `node_id` 的值完全一致
+- 新增節點就複製一段 `[新的node_id]` 區塊，不用建立新檔案
+
+```ini
+ORACLE_URL=https://myproj2.dpdns.org
+VERIFY_TLS=false
+
+[kaggle-1]
+NODE_API_KEY=<跟 NODE_API_KEYS_JSON 的 kaggle-1 一致>
+MODEL_NAME=qwen3-coder:30b
+
+[lightning-1]
+NODE_API_KEY=<跟 NODE_API_KEYS_JSON 的 lightning-1 一致>
+MODEL_NAME=qwen3-coder:30b
+```
+
+**這個檔案含有 `NODE_API_KEY` 明碼，不要 commit 進 git**——repo 的
+`.gitignore` 已經排除 `edge-worker/edge.conf`（只保留不含真實金鑰的
+`edge.conf.example`），正常操作不會不小心加進版本控制，但如果你是手動
+`git add -A`，還是要留意一下。
+
+存好之後，`/start-node node_id:kaggle-1` 才會正確讀到 `[kaggle-1]` 這個
+區塊；找不到對應區塊時，`/start-node` 會直接回報「找不到這個區塊」並中止，
+不會用任何寫死的預設值悄悄啟動。缺欄位時（例如忘了填 `MODEL_NAME`）會退回
+合理預設值（`qwen2.5-coder:14b`），但這次會在 Discord 回覆訊息裡明確列出
+「用了哪些欄位的預設值」，不會再悄悄發生。
+
+**手動模式（不透過 Discord，自己貼進 Kaggle/Colab/Lightning 執行）**：因為
+`edge.conf` 現在可能裝了不只一個節點的設定，`bootstrap.py` 沒辦法自己猜要
+跑哪一個，執行時要用 `--node-id` 明確指定（或設定環境變數 `NODE_ID`）：
+
+```bash
+python bootstrap.py --node-id kaggle-1
+```
+
+如果 `edge.conf` 從頭到尾都只有一個節點、完全沒有寫 `[區塊]`（沿用最原始的
+單節點平鋪格式），`bootstrap.py` 會直接把整份檔案當成這一個節點的設定，
+維持零參數也能執行，不強制要求 `--node-id`。
+
 ### 7-B.7：Kaggle 節點：確認 kernel_slug、把 Bot 邀進管理伺服器
 
 `NODE_PLATFORM_MAP` 裡 Kaggle 節點的 `kernel_slug`，對應 `kaggle kernels push`
@@ -1429,6 +1492,32 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v27（本次）
+
+延續先前「節點模型設定容易悄悄套用寫死預設值」的問題（`NODE_PLATFORM_MAP` 沒填
+`model_name` 時會靜默退回 `qwen2.5-coder:14b`），原本改成每個節點各自一份
+`edge-worker/nodes/<node_id>.conf`，但節點數一多、檔案數量跟著線性增加，管理
+成本仍偏高。這輪改成**單一 `edge-worker/edge.conf`，用 `[node_id]` 區塊分隔
+每個節點**，兼顧「單一事實來源」跟「一份檔案就能看到所有節點設定」：
+
+| 檔案 | 變更 |
+|------|------|
+| `edge-worker/bootstrap.py` | `load_conf()` 改寫為 `load_conf_sections()`：解析 `[node_id]` 區塊，區塊前的 `KEY=VALUE` 當作所有節點共用的預設值，區塊內同名 `KEY` 覆蓋預設值；`NODE_ID` 改成優先用 `--node-id`／環境變數／區塊前的預設值決定，決定後才知道要套用哪個區塊的設定；完全向後相容：`edge.conf` 沒有任何 `[區塊]` 時行為跟改版前一樣，不強制要求 `--node-id`；升級至 v8 |
+| `bot-gateway/node_controllers/base.py` | `load_node_conf()` 改成讀取單一 `edge-worker/edge.conf` 並解析 `[node_id]` 區塊（`NODE_CONF_DIR` 換成 `NODE_CONF_PATH`），不再逐檔案比對 `NODE_ID` 是否跟檔名一致（區塊名稱本身就是 node_id，不會再有這種落差）；其餘驗證邏輯（必填欄位、缺欄位套用預設值並回傳 `_warnings`）不變 |
+| `bot-gateway/node_controllers/kaggle.py` | 無需改動——呼叫 `load_node_conf(node_id)` 的介面簽名沒變，內部讀取來源的改變對它透明 |
+| `bot-gateway/node_controllers/lightning.py` | 同上，無需改動 `load_node_conf` 呼叫方式；本次同時合併獨立完成的 `machine`（GPU 型號）指定功能，兩者互不衝突 |
+| `edge-worker/edge.conf` | 從「每節點一份 `nodes/<node_id>.conf`」改回單一檔案，用 `[kaggle-1]`／`[lightning-1]` 等區塊管理，共用值（`ORACLE_URL`、`VERIFY_TLS` 等）只在檔案最上面寫一次 |
+| `edge-worker/edge.conf.example`（新增） | 不含真實金鑰的格式範例，示範共用預設值＋多節點區塊的寫法 |
+| `edge-worker/nodes/`（移除） | 上一輪新增的每節點一份檔案的目錄，這輪確認節點數增加後管理成本仍偏高，改用單檔分區塊設計取代 |
+| `.gitignore` | 排除規則從 `edge-worker/nodes/*.conf` 改成 `edge-worker/edge.conf`（保留 `edge.conf.example` 進版本控制） |
+| `DEPLOY.md`（本檔） | Step 7-B.6.5 改寫為單一 `edge.conf` 分區塊的建立流程，並新增手動模式下需要用 `--node-id` 指定節點的說明 |
+
+**這輪同時盤點過「變更紀錄是否都彙整在文末」跟「變更紀錄內容有沒有該補進
+Step 正文卻漏掉的部分」**：確認 v4～v26 的變更紀錄本來就已經全部集中在本節
+（「## 變更紀錄摘要」）底下、依版本倒序排列，沒有散落在文件其他地方；逐筆核對
+後也沒有發現變更紀錄裡提到、但正文 Step 找不到對應說明的落差項目，本輪未做
+額外異動。
 
 ### v26（本次）
 

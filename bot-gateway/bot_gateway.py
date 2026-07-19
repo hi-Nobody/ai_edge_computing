@@ -554,45 +554,18 @@ async def process_start_node(node_id: str, application_id: str, interaction_toke
         await discord_edit_original(application_id, interaction_token, f"⚠️ {e}")
         return
 
-    # 把 Oracle 端本來就有的連線資訊、節點各自的模型設定一併傳給 controller，
-    # 這樣 Kaggle/Lightning 那邊產生的 edge.conf 才會跟這個節點該用的設定一致。
-    # NODE_API_KEY 直接沿用 server.py 也在用的同一份 NODE_API_KEYS_JSON，
-    # 不要求使用者為了群控功能又重複登記一次金鑰。
-    try:
-        keys_map = json.loads(os.environ.get("NODE_API_KEYS_JSON", "{}"))
-    except json.JSONDecodeError:
-        keys_map = {}
-
-    # DOMAIN_NAME 優先於 ORACLE_PUBLIC_IP：如果照 DEPLOY.md Step 4-A「⑤」的
-    # 建議收緊了 OCI Security List（只允許 Cloudflare 的 IP 段連進
-    # 443），Kaggle/Colab/Lightning 這些外部節點對 ORACLE_PUBLIC_IP 直連
-    # 會被防火牆直接擋掉（連 TLS 握手都到不了），節點端的心跳／輪詢/停止
-    # 信號全部靜默失敗，症狀是「看起來啟動成功，但永遠查不到硬體規格、
-    # 也永遠關不掉」——因為這兩件事都要靠節點成功連回 Oracle 才做得到。
-    # 有設定 DOMAIN_NAME 就一定要用它（會走 Cloudflare，不受那條防火牆
-    # 規則影響），沒設定才退回直連 IP。
-    domain_name = os.environ.get("DOMAIN_NAME", "").strip()
-    oracle_public_ip = os.environ.get("ORACLE_PUBLIC_IP", "").strip()
-    oracle_public_host = domain_name or oracle_public_ip
-    full_config = {
-        **config,
-        "oracle_url": f"https://{oracle_public_host}" if oracle_public_host else "",
-        "node_api_key": keys_map.get(node_id, ""),
-    }
-
-    if not full_config["oracle_url"]:
-        await discord_edit_original(application_id, interaction_token,
-                                     "⚠️ finflow-queue.env 裡的 DOMAIN_NAME、ORACLE_PUBLIC_IP "
-                                     "兩個都是空的，無法組出邊緣節點要連線的網址，"
-                                     "請先確認至少一個有填。")
-        return
-    if not full_config["node_api_key"]:
-        await discord_edit_original(application_id, interaction_token,
-                                     f"⚠️ 找不到節點 `{node_id}` 的 NODE_API_KEY，"
-                                     f"請確認 NODE_API_KEYS_JSON 裡有登記這個節點。")
-        return
-
-    result = await _run_blocking(controller.start, node_id, full_config)
+    # 節點的身分／模型／連線資訊（ORACLE_URL、NODE_API_KEY、MODEL_NAME 等）
+    # 不在這裡組裝——NODE_PLATFORM_MAP 現在只保留「怎麼呼叫這個平台的 API」
+    # 需要的欄位（kernel_slug／accelerator、studio_name／teamspace），其餘
+    # 一律由 controller 自己去讀 edge-worker/edge.conf 裡對應的 [node_id]
+    # 區塊（見
+    # node_controllers/base.py 的 load_node_conf()）。這是刻意的設計：
+    # 手動貼進 Kaggle/Lightning 網頁執行、跟這裡的 Discord 遠端觸發，
+    # 兩條路徑保證讀到同一份設定檔，不會再有「VPS 端記的值」跟「節點檔案
+    # 裡寫的值」兜不起來的情況（先前 DOMAIN_NAME／ORACLE_PUBLIC_IP 選用邏輯
+    # 寫在這裡時就出現過一次類似的落差，這次直接把整個組裝邏輯搬掉，而不是
+    # 繼續在這裡補更多特殊情況判斷）。
+    result = await _run_blocking(controller.start, node_id, config)
     prefix = "✅" if result.ok else "❌"
     msg = f"{prefix} {result.message}"
     if result.ok and platform == "kaggle":

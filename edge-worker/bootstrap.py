@@ -1,5 +1,17 @@
 """
-FinFlow 邊緣節點啟動腳本 v7
+FinFlow 邊緣節點啟動腳本 v8
+
+新增功能（相對 v7）：
+  - edge.conf 支援用 [node_id] 分區塊，一份檔案同時裝下多個節點的設定
+    （NODE_ID／NODE_API_KEY／MODEL_NAME 等），不用每加一個節點就多開一個
+    檔案。區塊開始前（也就是檔案最上面）的 KEY=VALUE 視為所有節點共用的
+    預設值（例如大家都指向同一個 ORACLE_URL 通常只需要寫一次），個別
+    區塊裡的同名 KEY 會覆蓋預設值。
+  - 完全向後相容：如果 edge.conf 裡完全沒有 [區塊]（舊格式、單一節點
+    平鋪 KEY=VALUE），行為跟 v7 一模一樣，不需要修改既有的單節點部署
+  - 手動執行時，如果 edge.conf 裡有多個 [區塊]，必須用 --node-id 或
+    環境變數 NODE_ID 明確指定要跑哪一個，或是在區塊開始前放一行
+    NODE_ID=xxx 當作「沒指定時的預設節點」
 
 新增功能（相對 v6）：
   - detect_vram() 改名/擴充為 detect_gpu_info()，除了 VRAM 總量，也回報
@@ -29,10 +41,14 @@ FinFlow 邊緣節點啟動腳本 v7
   - 設定優先順序：CLI 參數 > 環境變數 > edge.conf > 預設值
 
 使用方式：
-  # 方式 A：修改 edge.conf 後直接跑（長期管理用）
+  # 方式 A：edge.conf 只有一個節點（沒有 [區塊]），修改後直接跑
   python bootstrap.py
 
-  # 方式 B：CLI 臨時指定模型（測試不同模型用）
+  # 方式 B：edge.conf 裝了多個節點的 [區塊]，用 --node-id 選其中一個
+  python bootstrap.py --node-id kaggle-1
+  python bootstrap.py --node-id lightning-1 --model qwen3:8b   # 同時臨時換模型
+
+  # 方式 C：CLI 臨時指定模型（測試不同模型用，node_id 沿用 edge.conf 的預設值）
   python bootstrap.py --model qwen3:8b
   python bootstrap.py --model deepseek-coder-v2:16b --node-id colab-1
 """
@@ -51,7 +67,7 @@ import requests
 # 起始時刻，不是等到 main() 執行到一半才記錄。
 _PROCESS_START_TIME = time.time()
 
-# ─── 1. 讀取 edge.conf（若存在）───────────────────────────────────────────
+# ─── 1. 讀取 edge.conf（若存在），支援 [node_id] 分區塊 ───────────────────
 
 # repo 內這兩個檔案現在放在 edge-worker/ 資料夾裡；但實際部署時常常是把
 # bootstrap.py、edge.conf 單獨複製到 Kaggle/Colab/Lightning 的工作目錄，
@@ -61,30 +77,76 @@ _PROCESS_START_TIME = time.time()
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_CONF_PATH = os.path.join(_SCRIPT_DIR, "edge.conf")
 
-def load_conf(path=_DEFAULT_CONF_PATH) -> dict:
-    """解析 key=value 格式的設定檔，忽略空行與 # 開頭的註解"""
-    conf = {}
+
+def load_conf_sections(path=_DEFAULT_CONF_PATH):
+    """解析 edge.conf，回傳 (top_level, sections)：
+      - top_level：第一個 [區塊] 出現之前的 KEY=VALUE，當作所有節點共用
+        的預設值
+      - sections：{node_id: {key: value, ...}}，每個區塊已經繼承了「這個
+        區塊開始當下」累積到的 top_level 值，區塊內同名 KEY 會覆蓋掉繼承
+        來的預設值
+
+    這支函式在 bot-gateway/node_controllers/base.py 裡有一份幾乎一模一樣
+    的拷貝（parse_conf_sections()）——那邊是 Oracle 端讀同一份 edge.conf
+    的邏輯，這邊是節點自己讀的邏輯，兩邊執行環境完全獨立（不同的 repo
+    checkout、不同的機器），沒辦法共用同一份程式碼，格式規則故意保持
+    完全一致，改動時記得兩邊一起改。"""
+    top_level, sections = {}, {}
     if not os.path.exists(path):
-        return conf
+        return top_level, sections
+    current = None
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if "=" in line:
-                key, _, val = line.partition("=")
-                conf[key.strip()] = val.strip()
-    return conf
+            if line.startswith("[") and line.endswith("]"):
+                current = line[1:-1].strip()
+                sections[current] = dict(top_level)  # 繼承目前為止的預設值
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip()
+            if not key:
+                continue
+            if current is None:
+                top_level[key] = val
+            else:
+                sections[current][key] = val
+    return top_level, sections
 
-CONF = load_conf()
+
+_TOP_LEVEL, _SECTIONS = load_conf_sections()
 
 # ─── 2. CLI 參數 ────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="FinFlow 邊緣節點啟動腳本")
 parser.add_argument("--model",      help="覆蓋 edge.conf 的 MODEL_NAME（例：qwen3:8b）")
-parser.add_argument("--node-id",    help="覆蓋 edge.conf 的 NODE_ID")
+parser.add_argument("--node-id",    help="edge.conf 裝了多個節點時，指定要用哪一個 [區塊]；"
+                                          "也可以用來覆蓋單節點 edge.conf 裡的 NODE_ID")
 parser.add_argument("--oracle-url", help="覆蓋 edge.conf 的 ORACLE_URL")
 ARGS = parser.parse_args()
+
+# NODE_ID 要先決定，才知道該用 edge.conf 裡哪個區塊的設定——決定順序是
+# CLI > 環境變數 > edge.conf 最上面（區塊之前）的預設 NODE_ID。如果
+# edge.conf 完全沒有 [區塊]（舊格式單一節點），_SECTIONS 是空的，下面
+# CONF 會直接退回整份 _TOP_LEVEL，行為跟 v7 完全一樣。
+_NODE_ID = ARGS.node_id or os.environ.get("NODE_ID") or _TOP_LEVEL.get("NODE_ID")
+if _SECTIONS:
+    if not _NODE_ID:
+        raise SystemExit(
+            f"edge.conf 裡有多個節點區塊（{', '.join(_SECTIONS.keys())}），"
+            f"必須用 --node-id 或環境變數 NODE_ID 指定要啟動哪一個，"
+            f"或是在 edge.conf 最上面（第一個 [區塊] 之前）加一行 NODE_ID=xxx 當預設值"
+        )
+    if _NODE_ID not in _SECTIONS:
+        raise SystemExit(
+            f"edge.conf 裡找不到 [{_NODE_ID}] 這個區塊，"
+            f"目前有的區塊：{', '.join(_SECTIONS.keys())}"
+        )
+
+CONF = _SECTIONS.get(_NODE_ID, _TOP_LEVEL) if _SECTIONS else _TOP_LEVEL
 
 # ─── 3. 設定優先順序：CLI > 環境變數 > edge.conf > 預設值 ─────────────────
 
@@ -99,7 +161,10 @@ def resolve(cli_val, env_key, conf_key, default):
 
 CONFIG = {
     "ORACLE_URL":    resolve(ARGS.oracle_url, "ORACLE_URL",    "ORACLE_URL",    "https://your-oracle-public-ip-or-domain"),
-    "NODE_ID":       resolve(ARGS.node_id,    "NODE_ID",       "NODE_ID",       f"node-{uuid.uuid4().hex[:8]}"),
+    # NODE_ID 不透過 resolve()：上面已經用同樣的 CLI > 環境變數 > edge.conf
+    # 優先序算出 _NODE_ID 了（還額外處理了多節點區塊比對），這裡直接沿用，
+    # 避免重算一次卻少了區塊比對的邏輯，兩處各算各的容易產生不一致
+    "NODE_ID":       _NODE_ID or f"node-{uuid.uuid4().hex[:8]}",
     "NODE_API_KEY":  resolve(None,            "NODE_API_KEY",  "NODE_API_KEY",  "change-me"),
     "MODEL_NAME":    resolve(ARGS.model,      "MODEL_NAME",    "MODEL_NAME",    "qwen2.5-coder:14b"),
     "OLLAMA_URL":    resolve(None,            "OLLAMA_URL",    "OLLAMA_URL",    "http://localhost:11434"),

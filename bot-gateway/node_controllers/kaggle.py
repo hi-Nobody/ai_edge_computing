@@ -27,7 +27,7 @@ import subprocess
 import logging
 from pathlib import Path
 
-from .base import NodeController, StartResult, StopResult
+from .base import NodeController, StartResult, StopResult, load_node_conf, NodeConfError
 
 log = logging.getLogger("node-controllers.kaggle")
 
@@ -93,19 +93,39 @@ class KaggleController(NodeController):
             return StartResult(False, False, "找不到 Kaggle kernel 模板檔案，部署是否完整？",
                                 detail=str(_TEMPLATE_DIR))
 
+        # 節點的身分／模型／連線資訊一律從 edge-worker/edge.conf 裡對應的
+        # [node_id] 區塊讀，
+        # 不再由 bot_gateway.py 動態組裝——這份檔案跟手動貼進 Kaggle 網頁執行
+        # 時用的是同一份，兩條啟動路徑不會再讀到不一致的設定（見 base.py
+        # load_node_conf() 的說明）。
+        try:
+            node_conf = load_node_conf(node_id)
+        except NodeConfError as e:
+            return StartResult(False, False, str(e))
+        warning_suffix = ""
+        if node_conf["_warnings"]:
+            warning_suffix = "\n\n⚠️ 以下欄位使用了預設值，不是你以為的設定：\n- " + \
+                              "\n- ".join(node_conf["_warnings"])
+
         try:
             with tempfile.TemporaryDirectory(prefix="kaggle-push-") as tmp:
                 tmp_path = Path(tmp)
 
+                # EDGE_CONF_BODY：把 nodes/<node_id>.conf 除了註解/空行以外的
+                # 每一行原樣重組回去，直接餵給階段二寫出的 edge.conf——不逐欄位
+                # 挑著填，這樣以後 edge.conf 的格式多了新欄位（例如 v6 的
+                # INFERENCE_ENGINE／VLLM_*），這裡完全不用跟著改，自動就會
+                # 一併帶過去，不會漏。
+                edge_conf_lines = [
+                    f"{k}={v}" for k, v in node_conf.items() if not k.startswith("_")
+                ]
                 script_tpl = string.Template(_KERNEL_SCRIPT_TEMPLATE.read_text(encoding="utf-8"))
                 script_content = script_tpl.substitute(
-                    ORACLE_URL=node_config["oracle_url"],
+                    ORACLE_URL=node_conf["ORACLE_URL"],
                     NODE_ID=node_id,
-                    NODE_API_KEY=node_config["node_api_key"],
-                    MODEL_NAME=node_config.get("model_name", "qwen2.5-coder:14b"),
-                    VERIFY_TLS=node_config.get("verify_tls", "false"),
-                    INFERENCE_TIMEOUT_SEC=str(node_config.get("inference_timeout_sec", 300)),
-                    IDLE_STOP_SEC=str(node_config.get("idle_stop_sec", 1800)),
+                    NODE_API_KEY=node_conf["NODE_API_KEY"],
+                    VERIFY_TLS=node_conf["VERIFY_TLS"],
+                    EDGE_CONF_BODY="\n".join(edge_conf_lines),
                     BOOTSTRAP_URL=BOOTSTRAP_RAW_URL,
                 )
                 (tmp_path / "kernel_script.py").write_text(script_content, encoding="utf-8")
@@ -190,7 +210,8 @@ class KaggleController(NodeController):
                 )
 
             msg = (
-                f"已透過 Kaggle API 觸發節點 `{node_id}`（kernel: {KAGGLE_USERNAME}/{kernel_slug}）。"
+                f"已透過 Kaggle API 觸發節點 `{node_id}`（kernel: {KAGGLE_USERNAME}/{kernel_slug}，"
+                f"模型：{node_conf['MODEL_NAME']}）。"
                 f"開機、裝 Ollama、拉模型可能需要幾分鐘，之後可以用 /list-nodes 確認是否已上線。"
             )
             if accelerator_unsupported:
@@ -200,6 +221,7 @@ class KaggleController(NodeController):
                     f"拿到節點。想指定型號的話，先跑 `kaggle kernels push -h` 確認這個版本"
                     f"實際支援的參數名稱，再回報更新 `kaggle.py`。"
                 )
+            msg += warning_suffix
             return StartResult(True, True, msg)
         except subprocess.TimeoutExpired:
             return StartResult(False, False, "呼叫 Kaggle API 逾時（60 秒內沒有回應），請稍後重試。")

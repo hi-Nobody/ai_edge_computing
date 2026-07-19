@@ -1,0 +1,44 @@
+# FinFlow 邊緣節點設定檔 —— 格式範例（不含真實金鑰，僅供參考）
+#
+# 實際部署時，複製這份成 edge.conf（去掉 .example 副檔名）並填入真實的值。
+# 這份檔案是所有節點的「單一事實來源」：
+#   - 手動模式：整份檔案內容貼進 Kaggle/Colab/Lightning 工作目錄，執行
+#     bootstrap.py 時用 --node-id 指定要跑哪個區塊
+#   - Discord 遠端模式：/start-node 觸發時，bot-gateway/node_controllers/
+#     （kaggle.py／lightning.py）會直接讀對應的 [node_id] 區塊（見
+#     node_controllers/base.py 的 load_node_conf()）
+# 兩條路徑保證讀到一模一樣的設定。
+#
+# 格式：用 [node_id] 分隔每個節點的設定；區塊開始「之前」的 KEY=VALUE 是
+# 所有節點共用的預設值，個別節點需要不同時在自己的區塊裡覆蓋即可。新增
+# 節點只要複製一個 [xxx] 區塊改內容，不需要另外開新檔案。
+#
+# edge.conf（沒有 .example 的正式檔）含有 NODE_API_KEY 明碼，**不要 commit
+# 進 git**——確認 repo 的 .gitignore 有排除 edge-worker/edge.conf。
+
+# ── 所有節點共用的預設值 ──
+# ORACLE_URL 必須對應 Oracle 端 finflow-queue.env 的 ORACLE_PUBLIC_IP（方案 A
+# 自簽憑證）或 DOMAIN_NAME（Step 4-A Cloudflare 代管憑證），這裡要填完整的
+# https:// URL，不是只填 IP／網域本身。
+ORACLE_URL=https://your-oracle-public-ip-or-domain
+VERIFY_TLS=false
+INFERENCE_TIMEOUT_SEC=300
+IDLE_STOP_SEC=1800
+
+# ── 節點一 ──
+# NODE_API_KEY 必須跟 Oracle 端 finflow-queue.env 的 NODE_API_KEYS_JSON 裡，
+# 這個 node_id 對應的值完全一致，改一邊沒改另一邊，節點會在 /jobs/next
+# 被 Oracle 拒絕（401 Invalid Node API Key）
+[kaggle-1]
+NODE_API_KEY=change-me-to-your-own-node-secret
+MODEL_NAME=qwen3-coder:30b
+# MODEL_NAME=qwen2.5-coder:14b
+# MODEL_NAME=qwen2.5-coder:32b
+# MODEL_NAME=qwen3:8b
+# MODEL_NAME=deepseek-coder-v2:16b
+# MODEL_NAME=codellama:13b
+
+# ── 節點二（範例：跟節點一共用 ORACLE_URL／VERIFY_TLS，只覆蓋自己的金鑰跟模型）──
+[lightning-1]
+NODE_API_KEY=change-me-to-your-own-node-secret
+MODEL_NAME=qwen3-coder:30b
