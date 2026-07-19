@@ -194,6 +194,12 @@ COMMAND_SETS = {
                 }
             ],
         },
+        {
+            "name": "history",
+            "description": "查看你最近幾則 /ask 的問答紀錄",
+            "type": 1,
+            "options": [],
+        },
     ],
     "admin": [
         {

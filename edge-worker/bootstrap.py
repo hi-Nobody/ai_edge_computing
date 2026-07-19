@@ -293,7 +293,7 @@ def start_ollama_and_wait(timeout_sec=60):
 
 # ─── 7. 節點註冊（心跳）───────────────────────────────────────────────────
 
-def register_node(vram_gb, gpu_name=None, gpu_count=0):
+def register_node(vram_gb, gpu_name=None, gpu_count=0, status="running"):
     try:
         requests.post(
             f"{CONFIG['ORACLE_URL']}/nodes/heartbeat",
@@ -306,15 +306,33 @@ def register_node(vram_gb, gpu_name=None, gpu_count=0):
                 "gpu_name":      gpu_name,
                 "gpu_count":     gpu_count,
                 "started_at":    _PROCESS_START_TIME,
-                "status":        "running",
+                "status":        status,
             },
             timeout=10,
             verify=CONFIG["VERIFY_TLS"],
         )
-        log.info(f"節點已向 Oracle 報到：{NODE_ID}｜平台：{PLATFORM}｜模型：{CONFIG['MODEL_NAME']}｜"
+        log.info(f"節點已向 Oracle 報到：{NODE_ID}｜狀態：{status}｜平台：{PLATFORM}｜模型：{CONFIG['MODEL_NAME']}｜"
                  f"GPU：{gpu_name or '未偵測到'} x{gpu_count}｜VRAM：{vram_gb}GB")
     except Exception as e:
         log.warning(f"心跳發送失敗（主迴圈會繼續重試）：{e}")
+
+
+import threading
+
+def _loading_heartbeat_loop(stop_event, vram_gb, gpu_name, gpu_count, interval_sec=25):
+    """`ensure_ollama()`／`ensure_model()` 這段是同步阻塞呼叫，中間沒有任何
+    機會送心跳——`ensure_model()` 拉一個 9B/14B 模型視情況要好幾分鐘，遠遠
+    超過 Oracle 端 NODE_DEAD_AFTER_SEC（60 秒）的判定門檻，導致節點明明還
+    活著（正在下載），`/list-nodes` 卻顯示離線，等下載完成才會忽然跳成
+    運作中，順序完全不符合直覺，也讓人誤以為節點中途斷過線。這裡用背景
+    執行緒每 25 秒補送一次心跳（status 設成 "loading"，不是 "running"，
+    這樣 /list-nodes 才能正確顯示成「下載中」而不是誤報成「已經 ready」），
+    在 main() 呼叫 register_node() 送出真正的 "running" 心跳之前，讓 Oracle
+    持續知道節點還活著。用 threading.Event().wait() 而不是 time.sleep()：
+    stop_event.set() 之後能立即結束，不用多等到下一次 interval_sec 才發現
+    該停了。"""
+    while not stop_event.wait(interval_sec):
+        register_node(vram_gb, gpu_name, gpu_count, status="loading")
 
 # ─── 8. 推論與任務回報 ──────────────────────────────────────────────────────
 
@@ -434,20 +452,41 @@ def main():
     if CONFIG["NODE_API_KEY"] == "change-me":
         log.warning("⚠️  NODE_API_KEY 仍是預設值，Oracle 端會拒絕此節點的請求")
 
-    ensure_ollama()
-    start_ollama_and_wait()
-    ensure_model(CONFIG["MODEL_NAME"])
-
+    # 提前到最前面偵測，讓下面的背景心跳執行緒從一開始就能帶著正確的 GPU
+    # 資訊送出心跳，不用等 ensure_ollama／ensure_model 跑完才知道
     vram_gb, gpu_name, gpu_count = detect_gpu_info()
-    register_node(vram_gb, gpu_name, gpu_count)
 
-    log.info("模型暖機中...")
+    stop_loading_heartbeat = threading.Event()
+    loading_heartbeat_thread = threading.Thread(
+        target=_loading_heartbeat_loop,
+        args=(stop_loading_heartbeat, vram_gb, gpu_name, gpu_count),
+        daemon=True,  # daemon=True：main process 结束時這條背景執行緒不會
+                      # 卡著不放，不需要額外處理它的收尾
+    )
+    loading_heartbeat_thread.start()
     try:
-        run_inference([{"role": "user", "content": "hi"}])
-        log.info("模型暖機完成")
-    except Exception as e:
-        log.warning(f"暖機失敗（不影響主流程）：{e}")
+        ensure_ollama()
+        start_ollama_and_wait()
+        ensure_model(CONFIG["MODEL_NAME"])
 
+        # 暖機（跑一次真正的推論觸發模型載入進 VRAM）實測可能花到 100 秒
+        # 以上，一樣遠超過 60 秒的離線判定門檻，所以背景心跳要蓋到這裡
+        # 結束為止，不能在暖機開始前就提早停掉、送出 "running"——那樣
+        # 暖機這段又會重演一次一模一樣的問題，只是空窗從「下載模型」
+        # 搬到「暖機」而已。
+        log.info("模型暖機中...")
+        try:
+            run_inference([{"role": "user", "content": "hi"}])
+            log.info("模型暖機完成")
+        except Exception as e:
+            log.warning(f"暖機失敗（不影響主流程）：{e}")
+    finally:
+        # 不管上面成功或丟例外，都要停止背景心跳——如果中途失敗，讓
+        # worker_loop／supervised_loop 外層的重試機制接手，不要讓一個
+        # 「一直送 loading 心跳、卻再也不會變成 running」的殭屍狀態留著
+        stop_loading_heartbeat.set()
+
+    register_node(vram_gb, gpu_name, gpu_count, status="running")
     supervised_loop(vram_gb, gpu_name, gpu_count)
 
 

@@ -1,191 +1,8 @@
-# FinFlow 分散式邊緣運算系統部署指南（v27，節點設定改為單一事實來源 edge.conf，用 [node_id] 分區塊管理多節點）
+# FinFlow 分散式邊緣運算系統部署指南（v30，文件重新編排：所有版本變更說明統一移至文末）
 
-> **v27** 內容變更摘要見文末「變更紀錄摘要」的 v27 小節；編號規則沿用 v22（見下方
-> 說明未變動）。
-
-> 本輪（v22）**只調整文件的編號與章節結構，沒有修改任何指令、程式碼或設定值**。
-> 起因是舊版編號規則混亂（例如「Step 4-1」到「Step 4-6」之後直接接「Step 4.5」，
-> 又混用「Step 4-D」；「Step 5.5」後面接「Step 5.7」，中間的 5.6 從缺；同一份文件裡
-> 「Step 4」在兩個地方分別代表完全不同的東西——一次是最上層的「啟用 HTTPS」，
-> 一次是「建立 Discord Bot」小節裡自己的第 4 個子步驟）。這次統一規則如下，
-> 之後新增內容也照這套規則寫：
->
-> - 主要 Step 依序編號（0、1、2、3...），不再用「X.5」這種指令一半數字代表新內容
-> - **選用（非必要）的整個 Step**，用「數字-字母」表示，例如 `Step 4-A`、`Step 7-A`、
->   `Step 7-B`，跟主線 Step 明確區分開來
-> - Step 底下的子章節用小數點編號（`4.1`、`6.3` 這種），子章節底下如果還有更細的
->   項目，繼續往下疊（`6.3.1`、`7-B.4` 這種），**子章節或項目一律不再重複使用「Step」
->   這個字**，只有最上層章節才叫 Step，避免像舊版「Step 4.5 底下又有 Step 1 到
->   Step 6」這種同一份文件裡兩個不同意義的「Step」造成混淆
-> - 內容較多的 Step 才拆子章節給標題編號，內容單純的維持一段到底，不刻意為了編號
->   而拆出沒必要的標題
->
-> **新舊編號對照表**（本文件其餘地方、包含下方 v21 以前的歷史變更紀錄，提到的
-> Step 編號都是「當時寫下時」的舊編號，本輪沒有回頭改寫歷史記錄，查閱時請對照
-> 下表換算成新編號）：
->
-> | 舊編號 | 新編號 | 內容 |
-> |---|---|---|
-> | Step 0 | Step 0 | 清空重建（未變） |
-> | Step 1 | Step 1 | Oracle 核心端安裝（未變） |
-> | Step 2 | Step 2 | 規劃金鑰（未變） |
-> | Step 3 | Step 3.1 | 設定為常駐服務 |
-> | Step 3.5 | Step 3.2 | 已知過的重大 bug（`/jobs/next` 路由順序） |
-> | Step 4（4-1～4-6） | Step 4（4.1～4.6） | 啟用 HTTPS |
-> | Step 4-D | Step 4-A | （選用）Cloudflare 代管憑證 |
-> | Step 4 疑難排解 | Step 5 | HTTPS／Caddy 疑難排解 |
-> | Step 4.5 | Step 6（6.1～6.7） | 部署 Bot Gateway |
-> | Step 4.5「建立 Discord Bot」內部 Step 1～6 | 6.3.1～6.3.6 | 同上，內部子步驟 |
-> | Step 5 | Step 7（7.1～7.2） | 邊緣節點端啟動 |
-> | Step 5.5 | Step 7-A | （選用）g4f 虛擬節點 |
-> | Step 5.7 | Step 7-B（7-B.1～7-B.9） | （選用）遠端節點群控 |
-> | Step 6 | Step 8 | 驗證 |
-> | Step 7 | Step 9 | SIT |
-
-> 本輪（v21）處理 Kaggle GPU 張數隨機分配的問題：`/start-node` 改成只開機、
-> 回報這次實際分配到的 GPU 型號/張數，不滿意可以直接關掉重開；確認滿意後
-> 新增的 `/load-node` 指令才會觸發真正的模型下載與部署。`/list-nodes` 現在
-> 會顯示 GPU 型號、張數、已運作時間，不用再自己從 VRAM 數字回推張數。
-> Lightning 不受影響，維持一次到位（機型是啟動時就明確指定的，沒有隨機分配
-> 的問題）。另外查證並修正了先前對「重試是否消耗 Kaggle 週配額」的說法——
-> 官方文件證實 GPU 加速器一開啟就開始計費，開機等待階段本身也會消耗配額，
-> 不是完全免費的操作。
-
-> 前一版（v20）差異：新增遠端節點群控功能，讓 Kaggle／Lightning 節點可以
-> 透過 Discord 指令遠端啟動/停止。
-
-> 本輪（v20）新增「Step 5.7：遠端節點群控」——在 Discord 下 `/start-node`、
-> `/stop-node`、`/list-nodes` 就能遠端開關 Kaggle／Lightning 節點，不用再手動
-> 登入瀏覽器點 cell。核心設計：`server.py` 新增輕量的「停止信號」機制（Kaggle
-> 沒有官方遠端停止 API，只能靠節點自己配合輪詢檢查）；新增
-> `bot-gateway/node_controllers/` 套件封裝兩個平台的差異（Kaggle 只能
-> start、stop 靠信號；Lightning 有官方 `Studio.stop()`，能真正即時關閉）；
-> 管理指令刻意掛在**另一個獨立的 Discord bot**（`/discord/admin-interactions`，
-> 獨立的 `DISCORD_ADMIN_PUBLIC_KEY`），跟一般問答用的 `/ask` bot 權限分離；
-> Lightning 額外有一個獨立背景執行緒定期檢查心跳、閒置太久主動關閉 Studio
-> 省錢，設計上刻意讓這個背景執行緒的呼叫失敗/卡住都不會拖累
-> `bot_gateway.py` 處理其他訊息、也完全不影響 `server.py`（`server.py`
-> 依然保持零平台知識）。另外把先前散落在根目錄的重複／過期
-> `bootstrap.py`／`edge.conf`／`bot_gateway.py` 清掉，統一以
-> `edge-worker/`、`bot-gateway/` 底下的為準。
-
-> 前一版（v19）差異：把「建立 Discord Bot」小節重寫成六步驟流程，新增
-> `discord-admin.env` 管理一次性腳本專用的機密資訊。
-
-> 本輪（v19）把「建立 Discord Bot」小節重寫成更詳細的六步驟流程（實際跑過一次部署
-> 才整理出來的順序），並把 `DISCORD_BOT_TOKEN`／`DISCORD_APPLICATION_ID` 這兩把
-> 一次性腳本才需要的機密資訊，從「臨時 `export`、用完即丟」改成寫進一個獨立的
-> `discord-admin.env`（不進版本控制，只有 `register_discord_commands.py` 執行時
-> `source` 讀取），比每次手動貼 token 方便，又不會混進 `bot-gateway.service` 常駐
-> 讀取的 `finflow-queue.env`。新增「Step 4 驗證失敗排錯」對照表，並把 TLS 需求的
-> 三個選項（方案 B／方案 C／上一版新增的 Step 4-D Cloudflare 代管憑證）一併列出。
-
-> 前一版（v18）差異：把原本過於簡略的「Step 4：啟用 HTTPS」整段改寫成手把手教學，
-> 新增「Step 4-D：改用 Cloudflare 代管憑證」與「Step 4 疑難排解」對照表。
-
-> 本輪（v18）把原本過於簡略的「Step 4：啟用 HTTPS」整段改寫成手把手教學：從 OCI
-> Cloud Shell 怎麼連進 Oracle VM 開始，`setup-https.sh` 內部每一步在做什麼都拆成表格
-> 逐條解釋，OCI 主控台開放 443 的每個點擊位置也寫清楚。新增「Step 4-D：改用 Cloudflare
-> 代管憑證」，把先前對話中討論過的 Cloudflare Proxy＋Full 加密模式接法正式寫進文件，
-> 作為 Discord 需要受信任憑證時的解法（原本方案 A 的自簽憑證無法滿足 Discord
-> Interactions Endpoint 的要求）。另外新增「Step 4 疑難排解」，把這幾輪對話裡真的
->踩過的坑（無 SNI 找不到憑證、Caddyfile 語法錯誤、環境變數替換成空字串、203/EXEC）
-> 整理成對照表，方便之後重新部署或交接給別人時快速定位問題。
-
-> 前一版（v17）差異：Step 1 統一改用 `pip install -r requirements.txt`（原本是直接
-> `pip install fastapi uvicorn pydantic requests`，跟 `bot-gateway/` 的安裝方式不一致，
-> 已確認並統一）；Step 4.5 補上 `bot-gateway/venv` 的 SELinux relabel 就地說明。
-
-> 本輪（v17）處理上一版留下的待確認事項與兩個文件缺口：**Step 1 確認改為 `pip install -r
-> requirements.txt`**（原本用 `pip install fastapi uvicorn pydantic requests` 純粹是舊版
-> 遺留寫法，不是刻意設計），並在旁邊列出這份根目錄 `requirements.txt` 實際裝了什麼、為何
-> 需要每一個套件；Step 4.5 的 `bot-gateway/venv` SELinux relabel 原本只有指令、要「見文件
-> 開頭」才有完整原因，這次把完整原因（`user_home_t` vs `init_t`／`bin_t`／`lib_t` 的機制）
-> 直接寫進 Step 4.5 本身，不用再往上翻；Step 3 補上一句預告，說明 Step 4.5 會重複同一套
-> `cp` 進 `/etc/systemd/system/` 的流程；順手修正「建立 Discord Bot」小節裡跟
-> `register_discord_commands.py` 實際行為不一致的「一次性動作」表述，並補上文件裡完全沒
-> 提過的 `--list`／`--delete` 子指令用法。
-
-> 本輪（v16）是把這份文件拿去跟一份獨立整理的「Step 1-13 部署規劃」逐項核對出來的結果：
-> 補上 Step 1 缺少的 git clone 具體教學、新增 Step 0（既有安裝要重新部署時該不該清空重建）、
-> Step 6 驗證補強分層檢查與 bot-gateway webhook 路由測試、新增 Step 7（SIT 系統整合測試
-> 檢查清單）。另外發現 Step 4.5 的 `bot-gateway/venv` SELinux relabel 指令只寫在檔頭、
-> Step 4.5 本身沒有就地提醒，容易被漏做，這次補上。
-
-> 本輪（v15）是實際把 Kaggle 節點接上 Oracle 之後，從「節點心跳正常、但送出的任務永遠
-> 卡在 `pending`／`Timeout waiting for edge nodes`」這個現象一路排查出來的，核心是
-> `server.py` 裡一個路由宣告順序的 bug，**不是網路、金鑰、或是 timeout 數值設太短的問題**
-> （雖然這次也順手把這幾項都優化了）。詳見「Step 3.5：已知過的重大 bug」與下方 v15 變更紀錄。
-> 另外新增邊緣節點「閒置自動停止」機制，避免忘記手動關閉 Kaggle/Colab session 而浪費 GPU 配額，
-> 詳見 Step 5。
-
-> 本文件取代前一版 DEPLOY.md。本輪（v13）評估過「把 `caddy.service` 併入
-> `finflow-queue.service`，減少要維護的環境變數設定檔案數量」這個提案，**決定不合併**：
-> 全系統目前只有一份機敏設定檔（`finflow-queue.env`），`finflow-queue.service`／
-> `bot-gateway.service` 兩個自己寫的 unit file 直接用 `EnvironmentFile=` 讀取，
-> `caddy.service` 因為是 `dnf`/`copr` 套件安裝、不歸這個 repo 管（套件更新會覆蓋
-> unit file 本體），只能透過 systemd 官方的 drop-in override 機制外掛一條
-> `EnvironmentFile=` 進去——這已經是「只有一份 env 檔」的狀態，真正把三個服務
-> 合併成一個 systemd unit 反而會製造新問題：Caddy 需要綁 443 特權 port、跑在
-> 專用的 `caddy` 系統帳號下，跟 `finflow-queue.service` 用的 `opc` 帳號、8000
-> 這種一般 port 的權限模型不同；systemd 一個 `Type=simple` 服務只能有一個主行程，
-> 硬塞兩個長駐行程進同一個 unit 會讓 `systemctl restart`／`journalctl` 沒辦法
-> 針對單一服務獨立操作與查log。維持三個服務分開、共用同一份 env 檔，是目前
-> 最合理的做法。
->
-> 本輪順手把原本埋在 `setup-https.sh` heredoc 裡的 caddy drop-in override 內容，
-> 抽成獨立檔案 `caddy-override.conf`（見「Step 4」），可被 git 追蹤、單獨 review
-> diff，`setup-https.sh` 改成直接 `cp` 這個檔案。
->
-> 前一版（v12）差異：改用 venv 部署（迴避 Ubuntu 新版 pip 限制）、
-> 檔名由 main.py 改為 server.py、**不需要額外設定 cron**（維護邏輯已改回自動背景執行緒）、
-> **新增 Discord Slash Command 支援**（`bot_gateway.py` 補上 `/discord/interactions`
-> 端點，可與 Telegram/LINE 並存或互相切換）、**`bootstrap.py` 改用 `edge.conf` 集中管理設定**
-> （支援 CLI 參數臨時覆蓋，見「Step 5」）、**新增 `g4f_worker.py` 虛擬節點**（不需要 GPU，
-> 用 g4f 逆向 API 當作額外一個運算節點，見「Step 5.5」）、**`Caddyfile`／`setup-https.sh`
-> 的 Oracle 公開 IP 改從 `finflow-queue.env` 的 `ORACLE_PUBLIC_IP` 讀取**，不再寫死在會被
-> commit 的檔案裡（見「Step 4」）、**邊緣運算相關檔案（`bootstrap.py`／`edge.conf`）整理進
-> `edge-worker/` 資料夾**（`g4f_worker.py` 維持在根目錄，跟 `server.py` 共用同一個 venv，
-> 見「Step 5.5」的說明），`server.py` 恢復 `GET /nodes` 監控端點、
-> **`bot_gateway.py`／`bot-gateway.service`／`register_discord_commands.py`／
-> bot 專用 `requirements.txt` 四個檔案整理進 `bot-gateway/` 資料夾**（見「Step 4.5」）、
-> `bot-gateway.service` 改用 `EnvironmentFile` 讀取 `finflow-queue.env`，不再把金鑰明碼寫在
-> unit file 裡（跟 `finflow-queue.service` 同一套修法，兩個服務現在共用同一份機敏設定檔）、
-> **VM 上的實際部署路徑最終定為 `/home/opc/finflow-queue/bot-gateway`**（巢狀在
-> `finflow-queue` 底下，取代先前試過的 `/home/opc/ui-bot`、`/home/opc/bot-gateway`
-> 兩種平行擺放的路徑，見版本紀錄 v12 的說明）。
->
-> 另外根據實際部署經驗補充：本文件範例路徑統一使用 `/home/opc`（OCI 預設使用者）。
-> 若你在 **Oracle Linux** 上部署，實測會遇到 **SELinux**
-> 擋下 `EnvironmentFile=` 指向 `/home/opc/...` 底下檔案的狀況（`systemd` 的
-> `init_t` domain 預設不能讀取一般家目錄的 `user_home_t` 檔案），導致
-> `systemctl restart` 出現「Job ... failed because of unavailable resources or
-> another system error」。修法是幫該檔案加上正確的 SELinux context，**不要**
-> 直接關掉 SELinux：
-> ```bash
-> sudo semanage fcontext -a -t systemd_unit_file_t "/home/opc/finflow-queue/finflow-queue.env"
-> sudo restorecon -v /home/opc/finflow-queue/finflow-queue.env
-> ```
-> `finflow-queue.service` 與 `bot-gateway.service` 現在共用同一份 `finflow-queue.env`，
-> 上面這個 relabel 只需要做一次，兩個服務都會受惠，不需要對 `bot-gateway.service`
-> 再另外處理一次 `EnvironmentFile` 的 SELinux context。
->
-> 但 `bot-gateway/venv/`（Python 執行檔本身）需要**另外**relabel，跟 `EnvironmentFile`
-> 是不同的坑（一個是「讀設定檔」被擋，一個是「執行程式」被擋）：
-> ```bash
-> sudo semanage fcontext -a -t bin_t '/home/opc/finflow-queue/bot-gateway/venv/bin(/.*)?'
-> sudo restorecon -Rv /home/opc/finflow-queue/bot-gateway/venv/bin
-> sudo semanage fcontext -a -t lib_t '/home/opc/finflow-queue/bot-gateway/venv/lib(/.*)?\.so(\.[0-9]+)*'
-> sudo restorecon -Rv /home/opc/finflow-queue/bot-gateway/venv/lib
-> ```
-> 這組 relabel 規則是綁在「路徑」上的，不是綁在「服務」上——如果之後又把
-> `bot-gateway/` 資料夾搬到別的地方（哪怕只是搬回本來的 `/home/opc/bot-gateway`），
-> 新路徑要重新下一次 `semanage fcontext`／`restorecon`，不會自動沿用；同時 venv
-> 內的 `venv/bin/uvicorn` 等進入點腳本的 shebang 也會寫死目前這個絕對路徑，資料夾
-> 一旦搬家就得整個 `rm -rf venv` 重建，不能只搬資料夾了事（這是實際部署時繞了
-> 兩三輪路徑才踩出來的兩個坑，見版本紀錄 v12）。
-
----
+> 完整的版本變更紀錄、各版本異動檔案說明、新舊 Step 編號對照表，全部收在文末
+> 「變更紀錄摘要」一節；文首只保留這行指標，不再重複貼一份。這是 v30 這次做的
+> 唯一結構調整，沒有修改任何指令、程式碼或設定值。
 
 ---
 
@@ -212,7 +29,7 @@ rm -rf /home/opc/finflow-queue
 ```
 
 **SELinux 的 `semanage fcontext` 規則不用特別清**——它是綁在「路徑字串」上的規則，
-不是綁在實際檔案上（見文件開頭版本說明裡 v12 的說明）；只要重建後的路徑跟原本
+不是綁在實際檔案上（見文末「變更紀錄摘要」v12 小節的說明）；只要重建後的路徑跟原本
 完全一樣（例如都是 `/home/opc/finflow-queue/...`），舊規則會繼續生效，`restorecon`
 照跑即可，不需要重新 `semanage fcontext -a`。只有當**新路徑跟舊路徑不同**時，才需要
 針對新路徑重新下一次。
@@ -316,7 +133,7 @@ User=opc
 WantedBy=multi-user.target
 ```
 
-**Oracle Linux 上請記得先做 SELinux 修正**（見文件最上方的說明），否則 `EnvironmentFile=` 指向
+**Oracle Linux 上請記得先做 SELinux 修正**，否則 `EnvironmentFile=` 指向
 `/home/opc` 底下的檔案會被 SELinux 擋下，出現「Job ... failed because of unavailable resources or
 another system error」：
 
@@ -439,7 +256,7 @@ sudo ./setup-https.sh
 | 步驟 1 | `sudo dnf makecache` 更新套件索引 | 確保等一下安裝 Caddy 時抓到的是最新版本資訊 |
 | 步驟 2 | 加入 Caddy 官方的 COPR repo、`dnf install caddy` | Oracle Linux 官方倉庫沒有 Caddy，COPR 是社群維護的額外套件庫 |
 | 步驟 3 | 把 `Caddyfile` 複製到 `/etc/caddy/Caddyfile` | `/etc/caddy/` 才是 Caddy 實際會讀取設定的路徑，repo 裡的只是原始檔案 |
-| 步驟 4 | 把 `caddy-override.conf` 複製到 `/etc/systemd/system/caddy.service.d/override.conf`，`daemon-reload` | 讓 `caddy.service` 這個 systemd 服務啟動時也能讀到 `ORACLE_PUBLIC_IP`（詳見文件開頭「為何不合併 caddy.service」的說明） |
+| 步驟 4 | 把 `caddy-override.conf` 複製到 `/etc/systemd/system/caddy.service.d/override.conf`，`daemon-reload` | 讓 `caddy.service` 這個 systemd 服務啟動時也能讀到 `ORACLE_PUBLIC_IP`（詳見文末「變更紀錄摘要」v13 小節「為何不合併 caddy.service」的說明） |
 | 步驟 5 | `systemctl enable` + `restart caddy` | 開機自動啟動，並用剛剛套用的新設定重啟一次 |
 | 步驟 6 | `firewall-cmd` 開放 443 port | Oracle Linux 內建的 OS 層防火牆，跟 OCI 網路層的 Security List 是兩層不同的防火牆，兩層都要開 |
 
@@ -1493,6 +1310,51 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 
 ## 變更紀錄摘要
 
+### v30（本次）
+
+文件結構調整：把文首那一長串逐版累積、跟 v10～v27 changelog 內容大量重複的版本
+說明（`git blame` 等級的「這輪改了什麼、上一輪改了什麼」逐版落落長描述）整段搬到
+文末，文首只留一行指標。原本文首唯一不是純重複的內容——v22 那份「新舊 Step 編號
+對照表」跟 v13 的「為何不合併 caddy.service」評估理由——分別搬進文末對應的 v22、
+v13 小節本體，不是直接刪掉；文件正文裡原本三處「見文件最上方／開頭的說明」這種
+交叉引用，也一併改成指向文末對應小節，避免變成連不到任何內容的死連結。沒有修改
+任何指令、程式碼或設定值。
+
+| 檔案 | 變更 |
+|------|------|
+| `DEPLOY.md`（本檔） | 文首從約 190 行的逐版說明精簡成 5 行指標；v22 小節補回完整的新舊編號對照表；v13 小節補回完整的 caddy 合併評估理由；Step 0、Step 3.1、Step 4 三處交叉引用改指向文末對應小節；新增本次 v30 changelog |
+
+### v29（本次）
+
+- `bot-gateway/bot_gateway.py`:
+  - `process_discord_interaction()` 回覆訊息開頭加回原始問題（`**你問：** xxx`）。
+    Discord 的「已使用 `/ask`」系統提示不會顯示 `prompt` 參數內容，捲動歷史訊息時
+    原本完全看不出當初問了什麼
+  - `discord_interactions()` 新增 `command_name == "history"` 分支：讀既有的
+    SQLite 對話紀錄（`get_history()`，本來就有在存，只是沒有指令能查），一問一答
+    成對整理、只顯示最近 5 組，同步回應（不用像 `/ask` 那樣 deferred，SQLite 讀取
+    夠快）
+- `bot-gateway/register_discord_commands.py`：`COMMAND_SETS["ask"]` 新增 `/history`
+  指令定義（無參數）
+
+**已知限制**：`/history` 目前只列最近 5 組問答、每則問題截 80 字／回答截 200 字，
+避免超過 Discord 單則訊息 2000 字元上限；資料庫實際保留筆數仍由
+`HISTORY_MAX_MESSAGES` 控制，這裡只是「顯示」的截斷，不影響儲存。
+
+### v28（本次）
+
+修正模型下載／暖機期間的心跳空窗。`main()` 原本流程是 `ensure_ollama()` ->
+`start_ollama_and_wait()` -> `ensure_model()`（下載模型，實測可能數分鐘）-> 暖機
+（實測可能上百秒）-> `register_node()` 送出第一次 `"running"` 心跳。整段下載＋暖機
+期間完全沒有心跳，遠超過 Oracle 端 `NODE_DEAD_AFTER_SEC`（60 秒），導致
+`/load-node` 觸發後、模型真正就緒前，`/list-nodes` 會誤報離線，等下載/暖機完成
+才忽然跳成運作中，順序不符合直覺。
+
+| 檔案 | 變更 |
+|------|------|
+| `edge-worker/bootstrap.py` | GPU 偵測提前到最前面；新增背景執行緒每 25 秒補送一次心跳（`status="loading"`），涵蓋 `ensure_ollama`／`ensure_model`／暖機整段，暖機結束後才停止背景心跳、送出真正的 `"running"` 心跳；`register_node()` 新增 `status` 參數供背景心跳複用 |
+| `bot-gateway/bot_gateway.py` | `process_list_nodes()` 新增 `status=="loading"` 的顯示分支（🟡 下載模型／暖機中，尚未就緒），跟既有的 booting／運作中 明確區分 |
+
 ### v27（本次）
 
 延續先前「節點模型設定容易悄悄套用寫死預設值」的問題（`NODE_PLATFORM_MAP` 沒填
@@ -1621,8 +1483,38 @@ GPU 型號、卻沒有明顯的錯誤訊息可以追，容易誤以為是自己 
 
 ### v22（本次）
 
-全文重新編號，沒有修改任何指令、程式碼或設定值。完整的新舊編號對照表見文件最上方
-版本說明。改動動機與具體規則：
+全文重新編號，沒有修改任何指令、程式碼或設定值。改動動機與具體規則：
+
+- 主要 Step 依序編號（0、1、2、3...），不再用「X.5」這種指令一半數字代表新內容
+- **選用（非必要）的整個 Step**，用「數字-字母」表示，例如 `Step 4-A`、`Step 7-A`、
+  `Step 7-B`，跟主線 Step 明確區分開來
+- Step 底下的子章節用小數點編號（`4.1`、`6.3` 這種），子章節底下如果還有更細的
+  項目，繼續往下疊（`6.3.1`、`7-B.4` 這種），子章節或項目一律不再重複使用「Step」
+  這個字，只有最上層章節才叫 Step
+- 內容較多的 Step 才拆子章節給標題編號，內容單純的維持一段到底
+
+**新舊編號對照表**（本文件其餘地方提到的 Step 編號都是「當時寫下時」的舊編號，
+沒有回頭改寫歷史記錄，查閱時請對照下表換算成新編號）：
+
+| 舊編號 | 新編號 | 內容 |
+|---|---|---|
+| Step 0 | Step 0 | 清空重建（未變） |
+| Step 1 | Step 1 | Oracle 核心端安裝（未變） |
+| Step 2 | Step 2 | 規劃金鑰（未變） |
+| Step 3 | Step 3.1 | 設定為常駐服務 |
+| Step 3.5 | Step 3.2 | 已知過的重大 bug（`/jobs/next` 路由順序） |
+| Step 4（4-1～4-6） | Step 4（4.1～4.6） | 啟用 HTTPS |
+| Step 4-D | Step 4-A | （選用）Cloudflare 代管憑證 |
+| Step 4 疑難排解 | Step 5 | HTTPS／Caddy 疑難排解 |
+| Step 4.5 | Step 6（6.1～6.7） | 部署 Bot Gateway |
+| Step 4.5「建立 Discord Bot」內部 Step 1～6 | 6.3.1～6.3.6 | 同上，內部子步驟 |
+| Step 5 | Step 7（7.1～7.2） | 邊緣節點端啟動 |
+| Step 5.5 | Step 7-A | （選用）g4f 虛擬節點 |
+| Step 5.7 | Step 7-B（7-B.1～7-B.9） | （選用）遠端節點群控 |
+| Step 6 | Step 8 | 驗證 |
+| Step 7 | Step 9 | SIT |
+
+具體改動對照：
 
 | 問題 | 修法 |
 |---|---|
@@ -1785,7 +1677,7 @@ bug，跟金鑰、網路、timeout 數值都無關（雖然後兩者這輪也一
 
 | 檔案 | 變更 |
 |------|------|
-| 評估：`caddy.service` 併入 `finflow-queue.service` | 決定不合併，理由詳見本文件最上方版本說明（權限模型衝突、systemd 單一主行程限制、套件更新會覆蓋合併後的 unit file）。目前架構已經是「全系統一份 `finflow-queue.env`，三個服務共用」，符合「減少設定散落」的原始訴求，不需要靠合併服務達成 |
+| 評估：`caddy.service` 併入 `finflow-queue.service` | 決定不合併。理由：全系統目前只有一份機敏設定檔（`finflow-queue.env`），`finflow-queue.service`／`bot-gateway.service` 兩個自己寫的 unit file 直接用 `EnvironmentFile=` 讀取，`caddy.service` 因為是 `dnf`/`copr` 套件安裝、不歸這個 repo 管（套件更新會覆蓋 unit file 本體），只能透過 systemd 官方的 drop-in override 機制外掛一條 `EnvironmentFile=` 進去——這已經是「只有一份 env 檔」的狀態，真正把三個服務合併成一個 systemd unit 反而會製造新問題：Caddy 需要綁 443 特權 port、跑在專用的 `caddy` 系統帳號下，跟 `finflow-queue.service` 用的 `opc` 帳號、8000 這種一般 port 的權限模型不同；systemd 一個 `Type=simple` 服務只能有一個主行程，硬塞兩個長駐行程進同一個 unit 會讓 `systemctl restart`／`journalctl` 沒辦法針對單一服務獨立操作與查 log。維持三個服務分開、共用同一份 env 檔，是目前最合理的做法 |
 | `caddy-override.conf`（新增檔案） | 把原本埋在 `setup-https.sh` heredoc 裡的 caddy systemd drop-in override 內容抽成獨立檔案，可被 git 追蹤、單獨 review diff |
 | `setup-https.sh` | 步驟 4 改成檢查並 `cp caddy-override.conf`，不再用 heredoc 內嵌內容 |
 | `DEPLOY.md`（本檔） | 版本號改為 v13；新增上述評估說明；Step 4 的流程描述同步更新 |

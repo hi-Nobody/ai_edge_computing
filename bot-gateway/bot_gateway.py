@@ -428,7 +428,12 @@ async def process_discord_interaction(user_id: str, prompt: str, application_id:
     if result["ok"]:
         history.append({"role": "assistant", "content": result["result"]})
         save_history(session_key, history)
-        await discord_edit_original(application_id, interaction_token, result["result"])
+        # 回覆訊息開頭把原始問題帶回去——Discord 那則灰字「已使用 /ask」
+        # 系統提示預設不會顯示你填的 prompt 參數內容，捲動歷史紀錄回去看
+        # 舊訊息時，只憑「已使用 /ask」完全看不出當初問的是什麼，訊息內容
+        # 本身要自己帶，不能依賴 Discord 介面幫忙記錄
+        reply = f"**你問：** {prompt}\n\n{result['result']}"
+        await discord_edit_original(application_id, interaction_token, reply)
     else:
         await discord_edit_original(application_id, interaction_token, f"⚠️ 處理失敗：{result['error']}")
 
@@ -460,13 +465,49 @@ async def discord_interactions(
             return {"type": 5}  # 重複重送，仍需回應合法格式，但不重新處理
 
         data = interaction.get("data", {})
-        options = data.get("options", [])
-        prompt = next((o.get("value") for o in options if o.get("name") == "prompt"), None)
+        command_name = data.get("name")
 
         user = (interaction.get("member") or {}).get("user") or interaction.get("user") or {}
         user_id = user.get("id")
         application_id = interaction.get("application_id")
         interaction_token = interaction.get("token")
+
+        if command_name == "history":
+            # 讀 SQLite 很快，不需要跟 /ask 一樣用 deferred + 背景任務，
+            # 直接同步回應（type=4），使用者不用多等一次「思考中...」
+            if not user_id:
+                return {"type": 4, "data": {"content": "⚠️ 無法解析使用者資訊。", "flags": 64}}
+            session_key = f"discord:{user_id}"
+            history = get_history(session_key)
+            if not history:
+                return {"type": 4, "data": {"content": "目前沒有任何歷史紀錄。", "flags": 64}}
+            # 一問一答成對顯示，只列最近幾組，避免超過 Discord 訊息長度上限
+            # （2000 字元）；HISTORY_MAX_MESSAGES 控制的是「資料庫裡留多少」，
+            # 這裡另外控制「這次回覆要顯示多少」，兩者目的不同不用共用同一個數字
+            pairs = []
+            i = 0
+            while i < len(history):
+                if history[i]["role"] == "user":
+                    q = history[i]["content"]
+                    a = history[i + 1]["content"] if i + 1 < len(history) and history[i + 1]["role"] == "assistant" else "（尚未回覆或已被截斷）"
+                    pairs.append((q, a))
+                    i += 2
+                else:
+                    i += 1
+            recent = pairs[-5:]
+            lines = [f"最近 {len(recent)} 則對話（資料庫實際保留 {len(history)} 則訊息，"
+                     f"上限 {HISTORY_MAX_MESSAGES} 則）：\n"]
+            for q, a in recent:
+                q_short = q if len(q) <= 80 else q[:80] + "…"
+                a_short = a if len(a) <= 200 else a[:200] + "…"
+                lines.append(f"**你：** {q_short}\n**AI：** {a_short}")
+            content = "\n\n".join(lines)
+            if len(content) > 1900:  # Discord 單則訊息上限 2000 字元，留一點緩衝
+                content = content[:1900] + "\n…（內容過長，已截斷）"
+            return {"type": 4, "data": {"content": content}}
+
+        options = data.get("options", [])
+        prompt = next((o.get("value") for o in options if o.get("name") == "prompt"), None)
 
         if not prompt or not user_id or not application_id or not interaction_token:
             return {
@@ -667,6 +708,8 @@ async def process_list_nodes(application_id: str, interaction_token: str):
             status_line = f"🔴 離線（曾經上線過{last_known}）"
         elif live_info.get("status") == "booting":
             status_line = f"🟡 開機中，等待 /load-node（{gpu_desc}）"
+        elif live_info.get("status") == "loading":
+            status_line = f"🟡 下載模型／暖機中，尚未就緒（模型：{model or '?'}，{gpu_desc}）"
         else:
             uptime = ""
             if live_info.get("started_at"):
