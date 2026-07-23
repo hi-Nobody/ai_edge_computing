@@ -1,4 +1,4 @@
-# FinFlow 分散式邊緣運算系統部署指南（v31，修正推論任務阻塞主執行緒期間的心跳空窗）
+# FinFlow 分散式邊緣運算系統部署指南（v32，Kaggle／Lightning 支援多帳號）
 
 > 完整的版本變更紀錄、各版本異動檔案說明、新舊 Step 編號對照表，全部收在文末
 > 「變更紀錄摘要」一節；文首只保留這行指標，不再重複貼一份。
@@ -985,6 +985,28 @@ LIGHTNING_IDLE_TIMEOUT_SEC=1800
 LIGHTNING_IDLE_CHECK_INTERVAL_SEC=60
 ```
 
+**多帳號（選填）**：以上 `KAGGLE_USERNAME`／`KAGGLE_KEY`、`LIGHTNING_USER_ID`／
+`LIGHTNING_API_KEY` 是「預設帳號」，所有沒有另外指定的 Kaggle／Lightning 節點
+都共用這組。如果你有第二個 Kaggle 帳號想拿來跑另一個節點（例如帳號一的週配額
+用完了），直接在 `NODE_PLATFORM_MAP` 那個節點自己的區塊裡加
+`kaggle_username`／`kaggle_key`（Lightning 則是 `lightning_user_id`／
+`lightning_api_key`）覆蓋掉預設值即可，不用改任何程式碼：
+
+```bash
+NODE_PLATFORM_MAP={"kaggle-1":{"platform":"kaggle","kernel_slug":"finflow-edge-kaggle-1"},"kaggle-2":{"platform":"kaggle","kernel_slug":"finflow-edge-kaggle-2","kaggle_username":"你的第二個Kaggle帳號","kaggle_key":"第二個帳號的key"}}
+```
+
+**Kaggle 多帳號沒有額外限制**——每次呼叫 `kaggle` CLI 都是獨立的 subprocess，
+各自帶自己的認證，帳號之間不會互相干擾，可以同時並行。
+
+**Lightning 多帳號有一個技術限制要知道**：`lightning_sdk` 只認**行程環境變數**
+做認證，沒有辦法像 Kaggle CLI 那樣每次呼叫各自帶一份認證資訊。所以切換帳號時，
+`node_controllers/lightning.py` 內部要真的去修改環境變數，為了避免兩個不同
+帳號的請求同時發生時互相污染，**同一時間只會有一個 Lightning 帳號的操作在
+執行，其餘的會排隊等待**（不會並行）。這對一般使用情境（三不五時開關一下節點）
+影響很小，只有你剛好同時對多個 Lightning 帳號連續下指令時，才會感覺到要排隊
+等一下。
+
 存檔後重啟 `bot-gateway`：
 
 ```bash
@@ -1075,8 +1097,10 @@ python bootstrap.py --node-id kaggle-1
 ### 7-B.7：Kaggle 節點：確認 kernel_slug、把 Bot 邀進管理伺服器
 
 `NODE_PLATFORM_MAP` 裡 Kaggle 節點的 `kernel_slug`，對應 `kaggle kernels push`
-實際會建立/更新的 kernel 名稱（完整會是 `<KAGGLE_USERNAME>/<kernel_slug>`）。
-第一次 `/start-node` 觸發時，如果這個 slug 在你的 Kaggle 帳號底下還不存在，
+實際會建立/更新的 kernel 名稱（完整會是 `<這個節點實際使用的 Kaggle 帳號>/<kernel_slug>`——
+預設是 `KAGGLE_USERNAME`，如果這個節點有另外設定 `kaggle_username` 覆蓋，見
+7-B.5 的多帳號說明，就會出現在那個帳號底下，不是預設帳號）。
+第一次 `/start-node` 觸發時，如果這個 slug 在對應的 Kaggle 帳號底下還不存在，
 push 應該會直接建立一個新的（這是 Kaggle API 一般的行為），但保險起見，第一次
 建議先手動確認一次 Kaggle 個人頁面有沒有正確出現這個 kernel。
 
@@ -1308,6 +1332,24 @@ curl -k -X POST https://<Oracle公開IP>/v1/chat/completions \
 ---
 
 ## 變更紀錄摘要
+
+### v32（本次）
+
+新增 Kaggle／Lightning 多帳號支援。原本 `KAGGLE_USERNAME`／`KAGGLE_KEY`、
+`LIGHTNING_USER_ID`／`LIGHTNING_API_KEY` 各只有一組，所有節點共用；現在可以
+在 `NODE_PLATFORM_MAP` 個別節點的區塊裡覆蓋，不用改任何程式碼就能讓不同節點
+用不同帳號（例如帳號一週配額用完，開第二個節點用另一個帳號的額度）。
+
+| 檔案 | 變更 |
+|------|------|
+| `bot-gateway/node_controllers/kaggle.py` | 新增 `_resolve_credentials()`，`node_config` 有 `kaggle_username`／`kaggle_key` 就覆蓋掉全域預設值；`_kaggle_env()` 改成接受呼叫端傳入的帳號，不再只認模組層級常數；`start()` 內所有用到帳號的地方（`_kaggle_env()` 呼叫、kernel-metadata 的 id 欄位、回覆訊息）都改用解析後的帳號。Kaggle CLI 每次呼叫都是獨立 subprocess、各自帶自己的 `env=`，多帳號不需要加鎖 |
+| `bot-gateway/node_controllers/lightning.py` | 新增 `_resolve_credentials()`（同上邏輯）；新增 `_lightning_credentials()` context manager，搭配全域 `threading.Lock`，暫時切換 `os.environ` 的 `LIGHTNING_USER_ID`／`LIGHTNING_API_KEY`、呼叫結束後換回原值；`_get_studio()` 改成接受解析後的 `user_id` 參數。**技術限制**：`lightning_sdk` 只認行程環境變數認證，沒有像 Kaggle CLI 那樣每次呼叫各自帶認證的機制，多帳號時同一時間只有一個 Lightning 帳號的操作在執行、其餘排隊，避免帳號互相污染 |
+| `finflow-queue.env` | `NODE_PLATFORM_MAP` 範例／註解補充多帳號用法；`KAGGLE_USERNAME`／`LIGHTNING_USER_ID` 等註解說明改為「預設帳號」，並指向可以在個別節點覆蓋 |
+| `DEPLOY.md`（本檔） | Step 7-B.5 新增多帳號設定範例與 Kaggle／Lightning 的能力差異說明；Step 7-B.7 補充 kernel 會出現在「這個節點實際使用的帳號」底下，不一定是預設帳號 |
+
+**已知取捨**：Lightning 多帳號會讓不同帳號的操作彼此排隊（不能真正並行呼叫
+`lightning_sdk`），這是為了避免 `os.environ` 被多個執行緒同時搶著改而互相
+污染帳號的必要代價。管理操作本身頻率不高，實務影響很小。
 
 ### v31（本次）
 

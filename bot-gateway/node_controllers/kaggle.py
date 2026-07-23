@@ -1,6 +1,15 @@
 """
 Kaggle 節點 controller —— 透過官方 `kaggle` CLI 觸發遠端執行。
 
+**多帳號支援**：`KAGGLE_USERNAME`／`KAGGLE_KEY` 是預設帳號（放
+finflow-queue.env）。如果某個節點要用不同的 Kaggle 帳號（例如帳號一的週
+GPU 配額用完了、想拿另一個帳號的額度來跑第二個節點），在 `NODE_PLATFORM_MAP`
+那個節點自己的區塊裡加 `"kaggle_username"`／`"kaggle_key"` 就會覆蓋掉預設值，
+不影響其他沒設定覆蓋值的節點。Kaggle CLI 每次呼叫都是獨立的 subprocess、
+自己帶一份 `env=`（不是全域共用一個已登入的 session），所以多帳號在 Kaggle
+這邊不需要加鎖或做序列化，跟 Lightning 那邊的情況不一樣（見 `lightning.py`
+檔頭說明——那邊的 SDK 只認行程環境變數，沒辦法每次呼叫各自帶一份）。
+
 **已知限制（不是這支程式的 bug，是 Kaggle 平台本身的限制）**：
     Kaggle 官方 API 沒有任何「遠端停止」端點（社群從 2021 年就在
     https://github.com/Kaggle/kaggle-api/issues/388 要求這個功能，至今
@@ -60,22 +69,37 @@ BOOTSTRAP_RAW_URL = os.environ.get(
 KAGGLE_HARD_TIMEOUT_SEC = int(os.environ.get("KAGGLE_HARD_TIMEOUT_SEC", "32400"))  # 9 小時
 
 
-def _kaggle_env():
+def _kaggle_env(username: str, key: str):
     """組出呼叫 kaggle CLI 需要的環境變數（不用 ~/.kaggle/kaggle.json 檔案，
-    kaggle 套件官方支援直接讀這兩個環境變數做認證，跟本專案其他金鑰一樣
-    集中放在 finflow-queue.env 管理）"""
+    kaggle 套件官方支援直接讀這兩個環境變數做認證）。username/key 由呼叫端
+    先解析好（可能是全域預設值，也可能是這個節點自己覆蓋的帳號），這支函式
+    只負責組裝，不做任何解析。"""
     env = os.environ.copy()
-    env["KAGGLE_USERNAME"] = KAGGLE_USERNAME
-    env["KAGGLE_KEY"] = KAGGLE_KEY
+    env["KAGGLE_USERNAME"] = username
+    env["KAGGLE_KEY"] = key
     return env
+
+
+def _resolve_credentials(node_config: dict):
+    """回傳 (username, key)：node_config 裡有 kaggle_username/kaggle_key
+    就用這個節點自己指定的帳號，沒有就退回 finflow-queue.env 的全域預設值。"""
+    username = node_config.get("kaggle_username") or KAGGLE_USERNAME
+    key = node_config.get("kaggle_key") or KAGGLE_KEY
+    return username, key
 
 
 class KaggleController(NodeController):
     platform_name = "kaggle"
 
     def start(self, node_id: str, node_config: dict) -> StartResult:
-        if not KAGGLE_USERNAME or not KAGGLE_KEY:
-            return StartResult(False, False, "尚未設定 KAGGLE_USERNAME／KAGGLE_KEY，無法啟動 Kaggle 節點。")
+        username, key = _resolve_credentials(node_config)
+        if not username or not key:
+            return StartResult(
+                False, False,
+                f"節點 `{node_id}` 沒有可用的 Kaggle 帳號——"
+                f"finflow-queue.env 的 KAGGLE_USERNAME／KAGGLE_KEY 是空的，"
+                f"NODE_PLATFORM_MAP 裡這個節點也沒有設定 kaggle_username／kaggle_key。",
+            )
 
         if not Path(_KAGGLE_CLI).exists():
             return StartResult(
@@ -132,7 +156,7 @@ class KaggleController(NodeController):
 
                 meta_tpl = string.Template(_KERNEL_METADATA_TEMPLATE.read_text(encoding="utf-8"))
                 meta_content = meta_tpl.substitute(
-                    KAGGLE_USERNAME=KAGGLE_USERNAME,
+                    KAGGLE_USERNAME=username,
                     KERNEL_SLUG=kernel_slug,
                     KERNEL_TITLE=f"FinFlow Edge Worker - {node_id}",
                 )
@@ -159,7 +183,7 @@ class KaggleController(NodeController):
 
                 result = subprocess.run(
                     push_cmd,
-                    env=_kaggle_env(),
+                    env=_kaggle_env(username, key),
                     capture_output=True,
                     text=True,
                     timeout=60,  # 這是「推送指令本身」在本機執行的逾時，
@@ -195,7 +219,7 @@ class KaggleController(NodeController):
                         "-t", str(KAGGLE_HARD_TIMEOUT_SEC),
                     ]
                     result = subprocess.run(
-                        push_cmd, env=_kaggle_env(), capture_output=True,
+                        push_cmd, env=_kaggle_env(username, key), capture_output=True,
                         text=True, timeout=60,
                     )
                     accelerator_unsupported = True
@@ -210,7 +234,7 @@ class KaggleController(NodeController):
                 )
 
             msg = (
-                f"已透過 Kaggle API 觸發節點 `{node_id}`（kernel: {KAGGLE_USERNAME}/{kernel_slug}，"
+                f"已透過 Kaggle API 觸發節點 `{node_id}`（kernel: {username}/{kernel_slug}，"
                 f"模型：{node_conf['MODEL_NAME']}）。"
                 f"開機、裝 Ollama、拉模型可能需要幾分鐘，之後可以用 /list-nodes 確認是否已上線。"
             )
